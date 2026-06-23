@@ -51,9 +51,9 @@ To skip SOAP computation (~20 min CPU) and model training (~3 hrs CPU):
 ```bash
 mkdir -p results/checkpoints
 # Download from GitHub Releases:
-wget https://github.com/YOUR_USERNAME/tco-conformal-uq/releases/download/v1.0.0/soap_features_v5.npz -P results/checkpoints/
-wget https://github.com/YOUR_USERNAME/tco-conformal-uq/releases/download/v1.0.0/mapie_form_v5.pkl -P results/checkpoints/
-wget https://github.com/YOUR_USERNAME/tco-conformal-uq/releases/download/v1.0.0/mapie_band_v5.pkl -P results/checkpoints/
+wget https://github.com/johmar-22/tco-conformal-uq/releases/download/v1.0.0/soap_features_v5.npz -P results/checkpoints/
+wget https://github.com/johmar-22/tco-conformal-uq/releases/download/v1.0.0/mapie_form_v5.pkl -P results/checkpoints/
+wget https://github.com/johmar-22/tco-conformal-uq/releases/download/v1.0.0/mapie_band_v5.pkl -P results/checkpoints/
 ```
  
 ## Usage
