@@ -1,6 +1,6 @@
 # Conformal Uncertainty Quantification for TCO Property Prediction
  
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.XXXXXXX.svg)](https://doi.org/10.5281/zenodo.XXXXXXX)
+[![DOI]
  
 **Paper:**  
 **Author:** Johaimen M Omar, Muhammed Tan  
