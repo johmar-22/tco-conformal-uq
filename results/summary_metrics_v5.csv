@@ -1,0 +1,16 @@
+Metric,Value,Reference / Note
+MAE Formation (eV/atom),0.01528,cf. Sutton et al. (2019) Table 1
+MAE Band Gap (eV),0.11368,cf. Sutton et al. (2019) Table 1
+RMSLE Formation,0.02112,NOMAD 2018 competition metric
+RMSLE Band Gap,0.08429,NOMAD 2018 competition metric
+R² Formation,0.9312,
+R² Band Gap,0.9668,
+CP Coverage Formation (90% nominal),0.9979,GroupKFold CV+ guarantee
+CP Coverage Band Gap,0.9854,GroupKFold CV+ guarantee
+Mean Interval Width Formation,0.338,
+Mean Interval Width Band Gap,1.4653,
+"Pearson(width,|err|) Formation",0.2436,>0 = informative intervals
+"Pearson(width,|err|) Band Gap",0.3347,>0 = informative intervals
+SHAP Kendall tau Formation (mean),0.8498,>0.9 = stable feature rankings
+SHAP Kendall tau Band Gap (mean),0.8198,>0.9 = stable feature rankings
+Indium proxy rho (band gap top feature),-0.9089,<0.9 = SOAP not pure In proxy

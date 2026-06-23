@@ -1,0 +1,5 @@
+Subset,N,Coverage,MAE,MeanWidth
+Metal (E_g < 0.10 eV),2,1.0,0.3705,1.4833
+Semiconductor (0.10 ≤ E_g < 3.0 eV),366,0.9809,0.1236,1.4576
+Insulator (E_g ≥ 3.0 eV),112,1.0,0.0768,1.4902
+TCO target window (2.0–4.0 eV),220,1.0,0.1008,1.4688

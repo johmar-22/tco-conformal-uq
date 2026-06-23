@@ -1,0 +1,3 @@
+Subset,N,Coverage,MAE,MeanWidth
+Stable (E_f ≤ 0.20 eV/atom),290,1.0,0.0108,0.3358
+Unstable (E_f > 0.20 eV/atom),190,0.9947,0.0221,0.3413

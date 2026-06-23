@@ -1,0 +1,22 @@
+# NOMAD geometry files (not redistributable — download from Kaggle)
+data/
+
+# Large model checkpoints and SOAP cache (uploaded as Release assets)
+results/checkpoints/*.pkl
+results/checkpoints/*.npz
+results/checkpoints/*.db
+
+# Exception: HPO params are tiny and should be committed
+!results/checkpoints/best_params_v5.json
+
+# Figure JPG companions (PDF versions are enough for the repo)
+results/*.jpg
+
+# Python bytecode and caches
+__pycache__/
+*.pyc
+*.pyo
+
+# OS files
+.DS_Store
+Thumbs.db
