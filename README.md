@@ -64,15 +64,6 @@ python uncertainty_quan.py
  
 The script is fully resumable. Re-run after any interruption.
  
-## Citation
+## UNDER REVIEW
  
-```bibtex
-@article{omar2025tco,
-  title   = {Conformal Uncertainty Quantification for Transparent Conductive
-             Oxide Property Prediction},
-  author  = {Omar, \"{O}mer and [adviser name]},
-  journal = {npj Computational Materials},
-  year    = {2025},
-  doi     = {}
-}
-```
+
