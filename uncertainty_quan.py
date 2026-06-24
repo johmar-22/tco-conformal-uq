@@ -147,11 +147,7 @@ except Exception:
 # n_jobs: use -1 on CPU (all cores), 1 on GPU (GPU manages parallelism)
 LGBM_JOBS = 1 if USE_GPU else -1
 
-# ---- Nature journal figure style ----
-# Based on Nature guide: https://www.nature.com/nature/for-authors/formatting-guide
-# Single column = 3.5 in (89 mm), double column = 7.2 in (183 mm)
-# Font: Arial/Helvetica, 5-7pt for labels/ticks, 7-8pt for titles
-# DPI: 600 for line art
+
 
 NATURE_DPI    = 600
 NATURE_FONT   = 'Arial'
