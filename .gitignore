@@ -1,15 +1,21 @@
 # NOMAD geometry files (not redistributable — download from Kaggle)
 data/
 
-# Large model checkpoints and SOAP cache (uploaded as Release assets)
+# Scratch figure directory (mirrored into results/ by the pipeline)
+figures_working/
+
+# Large binaries: distributed as GitHub Release assets, not committed
 results/checkpoints/*.pkl
 results/checkpoints/*.npz
 results/checkpoints/*.db
+results/checkpoints/pipeline_stage_v5.json
+results/checkpoints/full_df_v5.pkl
+results/checkpoints/df_valid_v5.pkl
 
-# Exception: HPO params are tiny and should be committed
+# Exception: HPO parameters are tiny and must be committed
 !results/checkpoints/best_params_v5.json
 
-# Figure JPG companions (PDF versions are enough for the repo)
+# Figure JPG companions (PDFs are committed; JPGs are regenerable)
 results/*.jpg
 
 # Python bytecode and caches
