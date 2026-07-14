@@ -1,73 +1,50 @@
 # -*- coding: utf-8 -*-
 """
-Conformal Uncertainty Quantification for Transparent Conductive Oxide
-Property Prediction: Coverage Diagnostics Under Crystal Symmetry Heterogeneity
+uncertainty_quan.py
+===================
 
-Dataset: NOMAD 2018 benchmark (Al_x Ga_y In_{1-x-y})_2O_3, DFT-PBE
-  Used as a controlled testbed for the UQ framework, not for materials discovery.
-  Band-gap values carry DFT-PBE systematic underestimate (~0.5-1.5 eV vs HSE/exp).
-  The benchmark contains exactly 6 crystal lattice symmetries (spacegroups 12, 33,
-  167, 194, 206, 227), enabling leave-one-lattice-out generalization tests.
+    "Conformal Uncertainty Quantification for Transparent Conductive Oxide
+     Property Prediction: Coverage Diagnostics Under Crystal Symmetry
+     Heterogeneity"
 
+Usage
+-----
+    pip install -r requirements.txt
+    python uncertainty_quan.py
 
-=============================================================================
-REPRODUCIBILITY INSTRUCTIONS
-=============================================================================
-1. Install dependencies:
-       pip install mapie==0.8.6 optuna dscribe shap lightgbm ase tqdm joblib
+Two reproduction modes:
 
-2. The CSV (train.csv) is downloaded automatically from GitHub on first run.
+1. CHECKPOINT MODE:
+   On first run the script downloads the pre-computed checkpoints published
+   as GitHub Release assets (v1.0.0): the SOAP feature cache, the prepared
+   train/test arrays, the fitted scaler, and the trained MAPIE CV+ models.
+   All tables and figures of the paper are then regenerated exactly.
+   Set the environment variable TCO_UQ_NO_DOWNLOAD=1 to disable downloading.
 
-3. For Section 6 outlier visualization and SOAP computation you need the
-   NOMAD 2018 XYZ geometry files. Download them from:
-     https://www.kaggle.com/c/nomad2018-predict-transparent-conductors/data
-   and extract so that DATA_ROOT = 'data/train/' contains one sub-folder
-   per structure ID, each with geometry.xyz inside.
-   If you only want to run from the CSV (no XYZ), the SOAP section will
-   skip gracefully and you can load a pre-computed SOAP cache instead.
+2. FULL RE-COMPUTATION MODE (~4 h CPU / ~45 min GPU):
+   Delete results/checkpoints/ and results/*.npz / *.pkl and provide the
+   NOMAD 2018 geometry files (not redistributable; download from
+   https://www.kaggle.com/c/nomad2018-predict-transparent-conductors/data)
+   under data/train/<id>/geometry.xyz. train.csv is fetched automatically.
 
-4. All outputs (figures, CSVs, model checkpoints) are written to RESULTS_DIR.
-=============================================================================
+All outputs are written to results/. Randomness is controlled by fixed
+seeds (SEED = 42; SHAP stability seeds 42/123/456/789/2024).
+Pinned dependencies (requirements.txt): mapie==0.8.6, dscribe==2.1.2.
 """
 
-# =============================================================================
-# SECTION 0: CONFIGURATION  (edit these paths before running)
-# =============================================================================
 
-# --- Output / checkpoint directories (created automatically) ---
-RESULTS_DIR    = 'results'                    # figures, CSVs, summary
-CHECKPOINT_DIR = 'results/checkpoints'        # model .pkl files, SOAP cache
-DATA_DIR       = 'data'                       # CSV cache lives here
+# SECTION 0: SETUP, IMPORTS, GPU DETECTION
 
-# --- NOMAD geometry files (only needed for SOAP + outlier visualization) ---
-# Download from Kaggle and extract so geometry.xyz files live at:
-#   DATA_ROOT/<id>/geometry.xyz
-DATA_ROOT = 'data/train'
+# Dependencies are installed via:  pip install -r requirements.txt
+# (pinned: mapie==0.8.6, dscribe==2.1.2 -- API/feature-layout critical)
 
-# --- Remote CSV (downloaded automatically on first run) ---
-TRAIN_URL = ('https://raw.githubusercontent.com/csutton7/'
-             'nomad_2018_kaggle_dataset/master/train.csv')
-
-# --- Cached paths (derived from the directories above) ---
-import os
-SOAP_CACHE     = os.path.join(CHECKPOINT_DIR, 'soap_features_v5.npz')
-DATA_CSV_CACHE = os.path.join(DATA_DIR,       'train_cache.pkl')
-PREP_CACHE     = os.path.join(CHECKPOINT_DIR, 'data_prep_v5.npz')
-HPO_CACHE      = os.path.join(CHECKPOINT_DIR, 'best_params_v5.json')
-STAGE_FILE     = os.path.join(RESULTS_DIR,    'pipeline_stage_v5.json')
-
-# =============================================================================
-# SECTION 0B: IMPORTS AND GLOBAL CONSTANTS
-# =============================================================================
-
-import json, gc, warnings, shutil, time
+import os, json, gc, warnings, shutil, time
 import numpy as np
 import pandas as pd
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
-import matplotlib.patches as mpatches
 import seaborn as sns
 from scipy.stats import spearmanr, kendalltau, pearsonr
 from collections import Counter
@@ -85,8 +62,7 @@ import joblib
 from mapie.regression import MapieRegressor
 from mapie.metrics import regression_coverage_score
 
-from ase.io import read as ase_read, write as ase_write
-from ase.visualize.plot import plot_atoms
+from ase.io import read as ase_read
 from dscribe.descriptors import SOAP
 from tqdm.auto import tqdm
 import shap
@@ -94,20 +70,89 @@ import shap
 warnings.filterwarnings('ignore')
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
+# ---------- Local, repository-relative paths (no Google Drive needed) ----------
+try:
+    REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+except NameError:            # interactive session / notebook
+    REPO_ROOT = os.getcwd()
+os.chdir(REPO_ROOT)
+
+RESULTS_DIR = os.environ.get('TCO_UQ_RESULTS', os.path.join(REPO_ROOT, 'results'))
+os.makedirs(RESULTS_DIR, exist_ok=True)
+
 SEED  = 42
 ALPHA = 0.10   # target coverage = 1 - ALPHA = 90%
 np.random.seed(SEED)
 
+from scipy.stats import beta as _beta_dist
+def clopper_pearson(k, n_trials, ci=0.95):
+    """Exact binomial (Clopper-Pearson) CI for k successes in n_trials."""
+    a = 1.0 - ci
+    lo = _beta_dist.ppf(a / 2, k, n_trials - k + 1) if k > 0 else 0.0
+    hi = _beta_dist.ppf(1 - a / 2, k + 1, n_trials - k) if k < n_trials else 1.0
+    return float(lo), float(hi)
+
 LATTICE_MAP = {
-    12: 'C/2m', 33: 'Pna21', 167: 'R3c',
+    12: 'C2/m', 33: 'Pna21', 167: 'R-3c',
     194: 'P63/mmc', 206: 'Ia-3', 227: 'Fd-3m',
 }
+# Older checkpoints/CSVs may carry the pre-v7 labels; normalise on load.
+LABEL_FIX = {'C/2m': 'C2/m', 'R3c': 'R-3c'}
 
-# Create all directories
-for d in [RESULTS_DIR, CHECKPOINT_DIR, DATA_DIR]:
+OUTPUT_DIR     = 'figures_working'                 # scratch dir, synced to results/
+CHECKPOINT_DIR = os.path.join(RESULTS_DIR, 'checkpoints')
+SOAP_CACHE     = os.path.join(CHECKPOINT_DIR, 'soap_features_corrected_v2.npz')
+DATA_ROOT      = os.path.join(REPO_ROOT, 'data', 'train')
+TRAIN_URL      = ('https://raw.githubusercontent.com/csutton7/'
+                  'nomad_2018_kaggle_dataset/master/train.csv')
+
+for d in [OUTPUT_DIR, CHECKPOINT_DIR]:
     os.makedirs(d, exist_ok=True)
 
+# ---- Pre-computed checkpoints (GitHub Release assets, no Drive needed) ----
+RELEASE_BASE = ('https://github.com/johmar-22/tco-conformal-uq/'
+                'releases/download/v1.0.0/')
+RELEASE_ASSETS = {                       # file name -> destination directory
+    'soap_features_corrected_v2.npz': CHECKPOINT_DIR,   # SOAP cache (~340 MB)
+    'data_prep_v5.npz':               CHECKPOINT_DIR,   # scaled arrays (~200 MB)
+    'scaler_v5.pkl':                  CHECKPOINT_DIR,   # fitted StandardScaler
+    'mapie_form_v5.pkl':              CHECKPOINT_DIR,   # trained CV+ model
+    'mapie_band_v5.pkl':              CHECKPOINT_DIR,   # trained CV+ model
+}
+
+def fetch_release_assets():
+    """Download missing checkpoint files from the GitHub Release.
+
+    Skipped when TCO_UQ_NO_DOWNLOAD=1 is set, or when the files already
+    exist. On download failure the pipeline falls back to full
+    re-computation (which requires the Kaggle geometry files for SOAP).
+    """
+    if os.environ.get('TCO_UQ_NO_DOWNLOAD', '0') == '1':
+        print('  [assets] TCO_UQ_NO_DOWNLOAD=1 -- skipping release downloads.')
+        return
+    import urllib.request
+    for fname, dest_dir in RELEASE_ASSETS.items():
+        dest = os.path.join(dest_dir, fname)
+        if os.path.exists(dest):
+            continue
+        url = RELEASE_BASE + fname
+        print(f'  [assets] Downloading {fname} ...')
+        try:
+            tmp = dest + '.part'
+            urllib.request.urlretrieve(url, tmp)
+            os.replace(tmp, dest)
+            print(f'  [assets] OK: {dest} '
+                  f'({os.path.getsize(dest)/1e6:.1f} MB)')
+        except Exception as e:
+            print(f'  [assets] WARNING: could not download {fname}: {e}')
+            print('  [assets] The pipeline will recompute this artefact '
+                  'from scratch if possible.')
+
+fetch_release_assets()
+
 # ---- Stage tracker (crash-safe resume) ----
+STAGE_FILE = os.path.join(CHECKPOINT_DIR, 'pipeline_stage_v5.json')
+
 def load_stage():
     if os.path.exists(STAGE_FILE):
         with open(STAGE_FILE) as f:
@@ -138,7 +183,7 @@ try:
             'gpu_device_id': 0,
         }
         print(f"GPU detected. LightGBM will use device_type='gpu'.")
-        print(result.stdout.split('\n')[8])
+        print(result.stdout.split('\n')[8])   # print GPU model line
     else:
         print("No GPU detected. Running on CPU.")
 except Exception:
@@ -147,17 +192,21 @@ except Exception:
 # n_jobs: use -1 on CPU (all cores), 1 on GPU (GPU manages parallelism)
 LGBM_JOBS = 1 if USE_GPU else -1
 
-
+# ---- Nature journal figure style ----
+# Based on Nature guide: https://www.nature.com/nature/for-authors/formatting-guide
+# Single column = 3.5 in (89 mm), double column = 7.2 in (183 mm)
+# Font: Arial/Helvetica, 5-7pt for labels/ticks, 7-8pt for titles
+# DPI: 600 for line art, 300 for halftone (we use 600 throughout)
 
 NATURE_DPI    = 600
-NATURE_FONT   = 'Arial'
-NATURE_FS_SM  = 7
-NATURE_FS_MD  = 8
-NATURE_FS_LG  = 9
-NATURE_LW     = 0.75
-NATURE_SINGLE = 3.5
-NATURE_DOUBLE = 7.2
-NATURE_HEIGHT = 2.8
+NATURE_FONT   = 'Arial'          # fallback: DejaVu Sans if Arial absent
+NATURE_FS_SM  = 7                # small text (tick labels, legend)
+NATURE_FS_MD  = 8                # medium (axis labels)
+NATURE_FS_LG  = 9                # large (panel titles)
+NATURE_LW     = 0.75             # default line width
+NATURE_SINGLE = 3.5              # single-column width (inches)
+NATURE_DOUBLE = 7.2              # double-column width (inches)
+NATURE_HEIGHT = 2.8              # default panel height
 
 # Colour palette (colour-blind safe, Nature Materials style)
 PALETTE = {
@@ -199,31 +248,31 @@ def set_nature_style():
 
 set_nature_style()
 
-def save_fig(fig, fname, subdir=RESULTS_DIR):
-    """Save figure locally (PDF + JPG at 600 DPI)."""
-    os.makedirs(subdir, exist_ok=True)
+def save_fig(fig, fname, subdir=OUTPUT_DIR):
+    """Save figure to the scratch dir and mirror it into results/."""
     local_path = os.path.join(subdir, fname)
-    fig.savefig(local_path, dpi=NATURE_DPI, bbox_inches='tight', facecolor='white')
-    # Also save a JPG companion
-    jpg_path = local_path.replace('.pdf', '.jpg')
-    fig.savefig(jpg_path, dpi=NATURE_DPI, bbox_inches='tight', facecolor='white')
+    fig.savefig(local_path, dpi=NATURE_DPI, bbox_inches='tight',
+                facecolor='white')
     plt.close(fig)
-    print(f"  Figure saved: {local_path}")
+    # Mirror into results/ immediately
+    drive_path = os.path.join(RESULTS_DIR, fname)
+    shutil.copy2(local_path, drive_path)
+    print(f"  Figure saved: {fname}")
 
 print(f"\nSetup complete  [v5 | GPU={USE_GPU} | DPI={NATURE_DPI}]")
 
-# =============================================================================
+
 # SECTION 1: DATA LOADING
-# =============================================================================
+
 print("\n--- Section 1: Loading Data ---")
+
+DATA_CSV_CACHE = os.path.join(CHECKPOINT_DIR, 'full_df_v5.pkl')
 
 if os.path.exists(DATA_CSV_CACHE):
     full_df = pd.read_pickle(DATA_CSV_CACHE)
-    print(f"Loaded CSV from cache: {len(full_df)} structures.")
+    print(f"Loaded CSV from local cache: {len(full_df)} structures.")
 else:
-    print(f"Downloading CSV from {TRAIN_URL} ...")
     full_df = pd.read_csv(TRAIN_URL)
-    os.makedirs(DATA_DIR, exist_ok=True)
     full_df.to_pickle(DATA_CSV_CACHE)
     print(f"Loaded {len(full_df)} structures; CSV cache saved.")
 
@@ -233,9 +282,9 @@ missing = [c for c in COMP_COLS if c not in full_df.columns]
 if missing:
     print(f"WARNING: Missing columns: {missing}")
 
-# =============================================================================
+
 # SECTION 2: SOAP DESCRIPTORS
-# =============================================================================
+
 print("\n--- Section 2: SOAP Features ---")
 
 if os.path.exists(SOAP_CACHE):
@@ -243,12 +292,15 @@ if os.path.exists(SOAP_CACHE):
     print(f"Loaded cached SOAP features: {X_soap.shape}")
 else:
     if not os.path.isdir(DATA_ROOT):
-        raise FileNotFoundError(
-            f"SOAP cache not found and DATA_ROOT does not exist: {DATA_ROOT}\n"
-            "Please download the NOMAD 2018 train geometry files from Kaggle\n"
-            "and extract them so that DATA_ROOT/<id>/geometry.xyz exists."
+        raise SystemExit(
+            f"\nSOAP cache not found ({SOAP_CACHE}) and geometry files are "
+            f"missing ({DATA_ROOT}).\n"
+            "Either (a) allow the release-asset download (unset "
+            "TCO_UQ_NO_DOWNLOAD), or\n(b) download the NOMAD 2018 data from "
+            "https://www.kaggle.com/c/nomad2018-predict-transparent-conductors/data\n"
+            "and unpack it so that data/train/<id>/geometry.xyz exists."
         )
-    print("Computing SOAP from scratch (~20 min on CPU).")
+    print("Computing SOAP from scratch (~20 min).")
     all_atoms = []
     for fid in tqdm(full_df['id'].values, desc='Reading .xyz'):
         path = os.path.join(DATA_ROOT, str(fid), 'geometry.xyz')
@@ -281,10 +333,12 @@ else:
     print(f"SOAP cache saved: {X_soap.shape}")
     save_stage('soap_computed')
 
-# =============================================================================
+
 # SECTION 3: DATA PREPARATION  (fully checkpointed)
 # =============================================================================
 print("\n--- Section 3: Data Preparation ---")
+
+PREP_CACHE = os.path.join(CHECKPOINT_DIR, 'data_prep_v5.npz')
 
 if os.path.exists(PREP_CACHE):
     print("  Loading prepared data from checkpoint...")
@@ -305,7 +359,19 @@ if os.path.exists(PREP_CACHE):
     test_idx       = d['test_idx']
     SOAP_DIM       = int(d['SOAP_DIM'])
     scaler         = joblib.load(os.path.join(CHECKPOINT_DIR, 'scaler_v5.pkl'))
-    df_valid       = pd.read_pickle(os.path.join(CHECKPOINT_DIR, 'df_valid_v5.pkl'))
+    _df_valid_path = os.path.join(CHECKPOINT_DIR, 'df_valid_v5.pkl')
+    if os.path.exists(_df_valid_path):
+        df_valid = pd.read_pickle(_df_valid_path)
+    else:
+        # Rebuild deterministically from train.csv + the SOAP cache
+        # (df_valid_v5.pkl is not shipped as a release asset).
+        _yf = full_df['formation_energy_ev_natom'].values.astype(np.float32)
+        _yb = full_df['bandgap_energy_ev'].values.astype(np.float32)
+        _mask = (np.isfinite(_yf) & np.isfinite(_yb) &
+                 ~np.isnan(X_soap).any(axis=1))
+        df_valid = full_df[_mask].reset_index(drop=True)
+        df_valid.to_pickle(_df_valid_path)
+        print(f"  Rebuilt df_valid ({len(df_valid)} rows) from train.csv + SOAP cache.")
     sg_names       = np.array([LATTICE_MAP.get(int(sg), f'SG{sg}')
                                for sg in sg_test])
     print(f"  Train: {X_train_scaled.shape}  Test: {X_test_scaled.shape}")
@@ -367,6 +433,7 @@ else:
     X_test_scaled  = scaler.transform(X_test).astype(np.float32)
     SOAP_DIM       = X_train_scaled.shape[1] // 4
 
+    # Save everything to the local checkpoint
     np.savez_compressed(PREP_CACHE,
         X_train_scaled=X_train_scaled, X_test_scaled=X_test_scaled,
         y_train_form=y_train_form, y_test_form=y_test_form,
@@ -393,10 +460,13 @@ FEATURE_NAMES = (
     [f'Max_{i:04d}'  for i in range(SOAP_DIM)]
 )
 
-# =============================================================================
+
 # SECTION 4: HPO  (Optuna TPE + GroupKFold + GPU)
-# =============================================================================
+
 print("\n--- Section 4: Hyperparameter Optimisation (GroupKFold + GPU) ---")
+
+# HPO params are cached locally. If they already exist, skip the trials.
+HPO_CACHE = os.path.join(CHECKPOINT_DIR, 'best_params_v5.json')
 
 if os.path.exists(HPO_CACHE):
     with open(HPO_CACHE) as f:
@@ -410,9 +480,9 @@ else:
     def optimize_lgbm_gkf(X, y, groups, study_name, n_trials=20):
         """
         Optuna TPE + GroupKFold(n=6) + GPU.
-        SQLite storage in CHECKPOINT_DIR = resumable if the process is interrupted.
+        SQLite storage = fully resumable if the run is interrupted mid-HPO.
         """
-        storage = f"sqlite:///{os.path.join(CHECKPOINT_DIR, study_name)}.db"
+        storage = f"sqlite:///{CHECKPOINT_DIR}/{study_name}.db"
         gkf     = GroupKFold(n_splits=6)
 
         def objective(trial):
@@ -434,7 +504,7 @@ else:
                 'reg_alpha':         trial.suggest_float('reg_alpha', 1e-4, 1.0, log=True),
                 'reg_lambda':        trial.suggest_float('reg_lambda', 1e-4, 1.0, log=True),
             }
-            base_params.update(GPU_PARAMS)
+            base_params.update(GPU_PARAMS)   # add GPU keys if detected
 
             fold_maes = []
             for tr_i, val_i in gkf.split(X, y, groups=groups):
@@ -473,6 +543,7 @@ else:
     best_params_band = optimize_lgbm_gkf(
         X_train_scaled, y_train_band, sg_train, 'lgbm_band_v5', n_trials=25)
 
+    # Save HPO results immediately
     with open(HPO_CACHE, 'w') as f:
         json.dump({'formation': best_params_form, 'bandgap': best_params_band}, f, indent=2)
     save_stage('hpo_complete')
@@ -482,9 +553,9 @@ print(f"  Formation: {best_params_form}")
 print(f"  Band Gap:  {best_params_band}")
 print(f"  GPU used for HPO: {USE_GPU}")
 
-# =============================================================================
+
 # SECTION 5: CONFORMAL PREDICTION TRAINING  (CV+, GroupKFold + GPU)
-# =============================================================================
+
 print("\n--- Section 5: Training Conformal Predictors (CV+ GroupKFold + GPU) ---")
 
 def build_lgbm(params):
@@ -498,7 +569,7 @@ def build_lgbm(params):
     )
 
 def train_conformal_gkf(X, y, params, groups, target_name, ckpt_name):
-    """Train CV+ with GroupKFold(n=6). Checkpoint auto-saved to CHECKPOINT_DIR."""
+    """Train CV+ with GroupKFold(n=6). Checkpoint auto-saved."""
     ckpt_path = os.path.join(CHECKPOINT_DIR, ckpt_name)
     if os.path.exists(ckpt_path):
         print(f"  Loading checkpoint: {ckpt_name}")
@@ -515,7 +586,9 @@ def train_conformal_gkf(X, y, params, groups, target_name, ckpt_name):
     mapie.fit(X, y, groups=groups)
     print(f"  Done in {(time.time()-t0)/60:.1f} min.")
     joblib.dump(mapie, ckpt_path, compress=3)
-    print(f"  Checkpoint saved: {ckpt_path}")
+    # Mirror to results/ root for extra safety
+    shutil.copy2(ckpt_path, os.path.join(RESULTS_DIR, ckpt_name))
+    print(f"  Checkpoint saved: {ckpt_name}")
     return mapie
 
 mapie_form = train_conformal_gkf(
@@ -528,9 +601,9 @@ mapie_band = train_conformal_gkf(
 save_stage('cp_training_complete')
 print("Conformal predictors trained and checkpointed.")
 
-# =============================================================================
-# SECTION 6: EVALUATION  (Nature figures, 600 DPI)
-# =============================================================================
+
+# SECTION 6: EVALUATION  
+
 print("\n--- Section 6: Evaluation ---")
 
 def rmsle(y_true, y_pred):
@@ -569,6 +642,7 @@ def parity_plot_nature(y_true, y_pred, lo, hi, xlabel, ylabel, panel_label, fnam
     """Nature-style parity plot: 600 DPI, no top/right spine, 8pt fonts."""
     fig, ax = plt.subplots(figsize=(NATURE_SINGLE, NATURE_SINGLE))
 
+    # Points coloured by absolute error
     abs_err = np.abs(y_true - y_pred)
     sc = ax.scatter(y_true, y_pred, c=abs_err, cmap='plasma',
                     s=6, alpha=0.6, linewidths=0, rasterized=True)
@@ -576,11 +650,13 @@ def parity_plot_nature(y_true, y_pred, lo, hi, xlabel, ylabel, panel_label, fnam
     cb.set_label('|Error|', fontsize=NATURE_FS_SM)
     cb.ax.tick_params(labelsize=NATURE_FS_SM)
 
+    # 90% CP interval band (sort by x to avoid fill_between artefacts)
     order = np.argsort(y_true)
     ax.fill_between(y_true[order], lo[order], hi[order],
                     alpha=0.15, color=PALETTE['blue'],
                     label='90% CP interval', zorder=0)
 
+    # y = x diagonal
     lim = [min(y_true.min(), y_pred.min()) - 0.05,
            max(y_true.max(), y_pred.max()) + 0.05]
     ax.plot(lim, lim, color=PALETTE['grey'], lw=NATURE_LW, ls='--', zorder=5)
@@ -588,11 +664,16 @@ def parity_plot_nature(y_true, y_pred, lo, hi, xlabel, ylabel, panel_label, fnam
 
     ax.set_xlabel(xlabel, fontsize=NATURE_FS_MD)
     ax.set_ylabel(ylabel, fontsize=NATURE_FS_MD)
+
+    # --- TITLE REPLACED WITH PANEL LABEL ---
     ax.text(0.0, 1.04, panel_label, transform=ax.transAxes,
             fontsize=NATURE_FS_LG, fontweight='bold', va='bottom', ha='left')
+    # ---------------------------------------
+
     ax.legend(fontsize=NATURE_FS_SM, loc='upper left')
 
-    r2  = r2_score(y_true, y_pred)
+    # Annotation: key metrics
+    r2 = r2_score(y_true, y_pred)
     mae = mean_absolute_error(y_true, y_pred)
     cov = regression_coverage_score(y_true, lo, hi)
     ax.text(0.97, 0.06,
@@ -603,8 +684,12 @@ def parity_plot_nature(y_true, y_pred, lo, hi, xlabel, ylabel, panel_label, fnam
                       ec=PALETTE['grey'], lw=0.5))
 
     plt.tight_layout(rect=[0, 0, 1, 0.95])
+
+    # --- ADDED JPG EXPORT AT 600 DPI ---
+    fig.savefig(os.path.join(RESULTS_DIR, fname.replace('.pdf', '.jpg')), dpi=600, bbox_inches='tight')  # JPG companion
     save_fig(fig, fname)
 
+# Passing (a) and (b) instead of string titles
 parity_plot_nature(
     y_test_form, res_form['y_pred'], res_form['lo'], res_form['hi'],
     'DFT formation energy (eV atom⁻¹)',
@@ -639,16 +724,16 @@ def cond_coverage_table(y_te, lo, hi, y_pred, subset_defs, tag):
     return df
 
 form_subsets = [
-    ('Stable (E_f <= 0.20 eV/atom)', y_test_form <= 0.20),
+    ('Stable (E_f ≤ 0.20 eV/atom)', y_test_form <= 0.20),
     ('Unstable (E_f > 0.20 eV/atom)', y_test_form > 0.20),
-    ('Strongly stable (E_f < -1.0 eV/atom)', y_test_form < -1.0),
+    ('Strongly stable (E_f < −1.0 eV/atom)', y_test_form < -1.0),
 ]
 band_subsets = [
     ('Metal (E_g < 0.10 eV)', y_test_band < 0.10),
-    ('Semiconductor (0.10 <= E_g < 3.0 eV)',
+    ('Semiconductor (0.10 ≤ E_g < 3.0 eV)',
      (y_test_band >= 0.10) & (y_test_band < 3.0)),
-    ('Insulator (E_g >= 3.0 eV)', y_test_band >= 3.0),
-    ('TCO target window (2.0-4.0 eV)',
+    ('Insulator (E_g ≥ 3.0 eV)', y_test_band >= 3.0),
+    ('TCO target window (2.0–4.0 eV)',
      (y_test_band >= 2.0) & (y_test_band <= 4.0)),
 ]
 
@@ -681,6 +766,7 @@ ratio = focal['mae_form'] / rare['mae_form'] if rare['mae_form'] > 0 else np.nan
 print(f"  MAE ratio frequent/rare: {ratio:.2f}  [<2.0 = no severe leakage]")
 group_stats.to_csv(os.path.join(RESULTS_DIR, 'leakage_defence_v5.csv'), index=False)
 
+
 # ---- 6.3 Spacegroup-stratified coverage ----
 print("\n--- Section 6.3: Spacegroup-Stratified Coverage (Novel) ---")
 
@@ -692,7 +778,7 @@ print("  " + "-"*80)
 for sg_int, sg_name in LATTICE_MAP.items():
     msk = sg_test == sg_int
     if not msk.any(): continue
-    n     = int(msk.sum())
+    n = int(msk.sum())
     cov_f = regression_coverage_score(y_test_form[msk], res_form['lo'][msk], res_form['hi'][msk])
     w_f   = float(np.mean(res_form['hi'][msk] - res_form['lo'][msk]))
     mae_f = mean_absolute_error(y_test_form[msk], res_form['y_pred'][msk])
@@ -708,8 +794,49 @@ for sg_int, sg_name in LATTICE_MAP.items():
 
 df_sg_form = pd.DataFrame(sg_rows_form)
 df_sg_band = pd.DataFrame(sg_rows_band)
+
+# ---- O1: Clopper-Pearson 95% CIs for per-spacegroup coverage (Table 4) ----
+for _df in (df_sg_form, df_sg_band):
+    _ks = np.rint(_df['Coverage'].values * _df['N'].values).astype(int)
+    _ci = [clopper_pearson(k, nn) for k, nn in zip(_ks, _df['N'].values)]
+    _df['Cov_CI95_lo'] = [round(c[0], 4) for c in _ci]
+    _df['Cov_CI95_hi'] = [round(c[1], 4) for c in _ci]
+print("\n  Coverage 95% Clopper-Pearson CIs (per spacegroup, Table 4):")
+for _tag, _df in (('formation', df_sg_form), ('band gap', df_sg_band)):
+    for _, _r in _df.iterrows():
+        print(f"    [{_tag:<9}] {_r['Lattice']:<8} {_r['Coverage']:.3f} "
+              f"[{_r['Cov_CI95_lo']:.3f}, {_r['Cov_CI95_hi']:.3f}]  (n={int(_r['N'])})")
+
 df_sg_form.to_csv(os.path.join(RESULTS_DIR,'sg_coverage_formation_v5.csv'), index=False)
 df_sg_band.to_csv(os.path.join(RESULTS_DIR,'sg_coverage_bandgap_v5.csv'), index=False)
+
+
+# SECTION 6.3b (O2): PER-SPACEGROUP SOAP ENVIRONMENT DIVERSITY
+
+# Converts the qualitative Fd-3m environment-diversity claim (manuscript
+# Sections 3.3/3.4) into a measured result: per-spacegroup mean feature
+# variance and mean pairwise SOAP descriptor distance on the test set.
+print("\n--- Section 6.3b: Per-Spacegroup SOAP Environment Diversity (O2) ---")
+from scipy.spatial.distance import pdist as _pdist
+_div_rows = []
+_rng = np.random.default_rng(SEED)
+for _sg_int, _sg_name in LATTICE_MAP.items():
+    _msk = sg_test == _sg_int
+    if not _msk.any(): continue
+    _Xg  = X_test_scaled[_msk]
+    _fv  = float(np.mean(np.var(_Xg, axis=0)))
+    _sel = _rng.choice(len(_Xg), size=min(len(_Xg), 60), replace=False)
+    _mpd = float(np.mean(_pdist(_Xg[_sel])))
+    _div_rows.append({'Lattice': _sg_name, 'SG': _sg_int, 'N': int(_msk.sum()),
+                      'MeanFeatureVar': round(_fv, 4),
+                      'MeanPairwiseDist': round(_mpd, 4)})
+    print(f"  {_sg_name:<8} n={int(_msk.sum()):>3}  mean feature var={_fv:8.4f}  "
+          f"mean pairwise dist={_mpd:9.4f}")
+_df_div = pd.DataFrame(_div_rows).sort_values('MeanPairwiseDist', ascending=False)
+_df_div.to_csv(os.path.join(RESULTS_DIR, 'soap_env_diversity_v7.csv'), index=False)
+_top_div = _df_div.iloc[0]['Lattice']
+print(f"  Most heterogeneous spacegroup by mean pairwise distance: {_top_div}")
+print("  -> cite soap_env_diversity_v7.csv in Section 3.3 ONLY if Fd-3m ranks first.")
 
 # Nature figure: spacegroup-stratified coverage
 fig, axes = plt.subplots(1, 2, figsize=(NATURE_DOUBLE, NATURE_HEIGHT))
@@ -724,18 +851,23 @@ for i, (ax, df_sg, tit) in enumerate(zip(axes,
                lw=NATURE_LW, label=f'Nominal {(1-ALPHA)*100:.0f}%', zorder=4)
 
     bold_color = '#d95f02'
+
     ax2 = ax.twinx()
     ax2.plot(x, df_sg['MeanWidth'], 'o-', color=bold_color,
              lw=NATURE_LW, ms=4, label='Mean width', zorder=5)
-    ax2.set_ylabel('Mean interval width', fontsize=NATURE_FS_SM, color=bold_color)
-    ax2.tick_params(axis='y', labelcolor=bold_color, labelsize=NATURE_FS_SM)
+    ax2.set_ylabel('Mean interval width', fontsize=NATURE_FS_SM,
+                   color=bold_color)
+    ax2.tick_params(axis='y', labelcolor=bold_color,
+                     labelsize=NATURE_FS_SM)
     ax2.spines['right'].set_visible(True)
     ax2.spines['right'].set_linewidth(NATURE_LW)
 
     ax.set_xticks(x)
     ax.set_xticklabels(df_sg['Lattice'], rotation=45, ha='right', va='top',
                        fontsize=NATURE_FS_SM)
+
     ax.tick_params(axis='x', pad=2)
+
     ax.set_ylim(0, 1.08)
     ax.set_ylabel('Empirical coverage', fontsize=NATURE_FS_MD)
 
@@ -746,6 +878,7 @@ for i, (ax, df_sg, tit) in enumerate(zip(axes,
 
     lines1, labels1 = ax.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
+
     ax.legend(lines1 + lines2, labels1 + labels2,
               fontsize=NATURE_FS_SM, loc='lower right',
               bbox_to_anchor=(1.0, 1.04), frameon=False, ncol=2)
@@ -753,22 +886,21 @@ for i, (ax, df_sg, tit) in enumerate(zip(axes,
     panel_label = '(a)' if i == 0 else '(b)'
     ax.text(0.0, 1.04, panel_label, transform=ax.transAxes,
             fontsize=NATURE_FS_LG, fontweight='bold', va='bottom', ha='left')
+
     ax.grid(axis='y', lw=0.4, alpha=0.4, zorder=0)
 
 plt.suptitle('Spacegroup-stratified CP coverage\n'
-             '(GroupKFold calibration -- each bar = one held-out lattice)',
+             '(GroupKFold calibration — each bar = one held-out lattice)',
              fontsize=NATURE_FS_LG, y=1.08)
+
 plt.tight_layout()
+
+# --- ADDED JPG EXPORT AT 600 DPI ---
+fig.savefig(os.path.join(RESULTS_DIR, 'sg_coverage_v5.jpg'), dpi=600, bbox_inches='tight')  # JPG companion
 save_fig(fig, 'sg_coverage_v5.pdf')
 
 # ---- 6.4 Interval-width informativeness ----
 print("\n--- Section 6.4: Interval Width Informativeness ---")
-#
-# Novel analysis: are wider CP intervals a reliable signal that prediction
-# errors will be larger? If Pearson(interval_width, |error|) > 0 and
-# statistically significant, the intervals are *informative* (not just valid).
-# This goes beyond the marginal coverage guarantee to show the intervals have
-# practical diagnostic value.
 
 def width_informativeness_plot(y_te, y_pred, widths, target_name, panel_label_1, panel_label_2, fname_tag):
     abs_err   = np.abs(y_te - y_pred)
@@ -790,8 +922,12 @@ def width_informativeness_plot(y_te, y_pred, widths, target_name, panel_label_1,
              label=f'Pearson r = {r_p:.3f}\np = {p_p:.1e}')
     ax1.set_xlabel('CP interval width', fontsize=NATURE_FS_MD)
     ax1.set_ylabel('|prediction error|', fontsize=NATURE_FS_MD)
+
+    # --- TITLE REPLACED WITH PANEL LABEL ---
     ax1.text(0.0, 1.04, panel_label_1, transform=ax1.transAxes,
              fontsize=NATURE_FS_LG, fontweight='bold', va='bottom', ha='left')
+    # ---------------------------------------
+
     ax1.legend(fontsize=NATURE_FS_SM)
     ax1.grid(lw=0.4, alpha=0.4)
 
@@ -802,39 +938,86 @@ def width_informativeness_plot(y_te, y_pred, widths, target_name, panel_label_1,
     ax2.set_xticklabels(q_stats.index.tolist(), fontsize=NATURE_FS_SM,
                          rotation=20, ha='right')
     ax2.set_ylabel('Mean |error|', fontsize=NATURE_FS_MD)
+
+    # --- TITLE REPLACED WITH PANEL LABEL ---
     ax2.text(0.0, 1.04, panel_label_2, transform=ax2.transAxes,
              fontsize=NATURE_FS_LG, fontweight='bold', va='bottom', ha='left')
+    # ---------------------------------------
+
     ax2.grid(axis='y', lw=0.4, alpha=0.4)
 
     plt.tight_layout(rect=[0, 0, 1, 0.95])
+
+    # --- ADDED JPG EXPORT AT 600 DPI ---
+    fig.savefig(os.path.join(RESULTS_DIR, f'width_informativeness_{fname_tag}_v5.jpg'), dpi=600, bbox_inches='tight')  # JPG companion
     save_fig(fig, f'width_informativeness_{fname_tag}_v5.pdf')
+
     print(f"  [{target_name}] Pearson r={r_p:.4f}  p={p_p:.2e}")
 
+# Generating panels (a) and (b) for Formation Energy
 width_informativeness_plot(
     y_test_form, res_form['y_pred'], res_form['widths'],
     'Formation energy', '(a)', '(b)', 'form')
 
+# Generating panels (c) and (d) for Band Gap
 width_informativeness_plot(
     y_test_band, res_band['y_pred'], res_band['widths'],
     'Band gap', '(c)', '(d)', 'band')
 
 save_stage('evaluation_complete')
 
-# ---- Conditional Coverage Figure (Task B -- paper-ready) ----
-print("\n--- Section 6.5: Conditional Coverage Figure (Task B) ---")
+"""
+Conditional Coverage Table — Task B (complete, paper-ready)
+============================================================
+Paste this block AFTER the existing Section 6.1 code in your notebook
+(i.e., after df_form_cond and df_band_cond have been computed).
 
+Produces:
+  1. A combined LaTeX / CSV table ready for the manuscript.
+  2. A single Nature-style figure (bar chart) showing coverage per subset
+     for both targets side-by-side, with the 90% nominal line marked.
+
+No new computations needed — uses df_form_cond and df_band_cond
+that your Section 6.1 already produces.
+"""
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import os
+
+# ── 0.  Palette (keep consistent with your existing style) ──────────────────
+PALETTE   = {'blue': '#2166AC', 'red': '#D6604D', 'grey': '#888888'}
+NATURE_FS = 7
+NATURE_FS_SM = 6
+
+# ── 1.  Annotate the tables with target label ────────────────────────────────
 df_form_cond['Target'] = 'Formation energy (eV/atom)'
 df_band_cond['Target'] = 'Band gap (eV)'
 
+# Re-order columns for the paper
 col_order = ['Target', 'Subset', 'N', 'Coverage', 'MeanWidth', 'MAE']
-combined = pd.concat([df_form_cond[col_order], df_band_cond[col_order]], ignore_index=True)
+df_form_display = df_form_cond[col_order].copy()
+df_band_display = df_band_cond[col_order].copy()
+
+combined = pd.concat([df_form_display, df_band_display], ignore_index=True)
+
+# ── 2.  Flag subsets that violate nominal 90% coverage ───────────────────────
+ALPHA = 0.10
 combined['BelowNominal'] = combined['Coverage'] < (1 - ALPHA)
 
 print("\n=== Combined Conditional Coverage Table ===")
 print(combined.to_string(index=False))
-combined.to_csv(os.path.join(RESULTS_DIR, 'conditional_coverage_combined.csv'), index=False)
 
-# LaTeX table snippet
+# ── 3.  Save CSV ─────────────────────────────────────────────────────────────
+
+out_csv = os.path.join(RESULTS_DIR, 'conditional_coverage_combined.csv')
+combined.to_csv(out_csv, index=False)
+print(f"\nCSV saved to: {out_csv}")
+
+# ── 4.  LaTeX table snippet ───────────────────────────────────────────────────
+# Prints a LaTeX table you can paste directly into the manuscript.
 print("\n=== LaTeX snippet ===\n")
 print(r"\begin{table}[ht]")
 print(r"\caption{\textbf{Conditional coverage by physical subset at $\alpha = 0.10$ (90\% nominal).}")
@@ -844,68 +1027,130 @@ print(r"\begin{tabular}{llcccc}")
 print(r"\toprule")
 print(r"Target & Subset & $N$ & Coverage & Width & MAE \\")
 print(r"\midrule")
+
 prev_target = None
 for _, row in combined.iterrows():
+    # Print a midrule between the two targets
     if prev_target is not None and row['Target'] != prev_target:
         print(r"\midrule")
     prev_target = row['Target']
+
+    target_str = row['Target'] if prev_target != row['Target'] else ''
     cov_str = f"{row['Coverage']:.3f}"
     if row['BelowNominal']:
         cov_str = r"\textbf{" + cov_str + r"}$^*$"
-    print(f"{row['Target']} & {row['Subset']} & {row['N']} "
-          f"& {cov_str} & {row['MeanWidth']:.3f} & {row['MAE']:.4f} \\\\")
+    print(
+        f"{row['Target']} & {row['Subset']} & {row['N']} "
+        f"& {cov_str} & {row['MeanWidth']:.3f} & {row['MAE']:.4f} \\\\"
+    )
+
 print(r"\bottomrule")
 print(r"\end{tabular}")
 print(r"\end{table}")
 
-# Conditional coverage bar chart
+# ── 5.  Figure: bar chart of coverage per subset ─────────────────────────────
+# Apply Nature-style font and line settings globally
+plt.rcParams.update({
+    'font.family': 'sans-serif',
+    'font.sans-serif': ['Helvetica', 'Arial', 'DejaVu Sans'],
+    'axes.labelsize': NATURE_FS,
+    'xtick.labelsize': NATURE_FS_SM,
+    'ytick.labelsize': NATURE_FS_SM,
+    'legend.fontsize': NATURE_FS_SM,
+    'axes.linewidth': 0.8,
+    'xtick.major.width': 0.8,
+    'ytick.major.width': 0.8
+})
+
 fig, axes = plt.subplots(1, 2, figsize=(7.2, 2.6))
+
 panel_labels = ['a', 'b']
+
 for i, (ax, (df_sub, unit)) in enumerate(zip(
     axes,
-    [(df_form_cond, 'eV/atom'), (df_band_cond, 'eV')],
+    [
+        (df_form_cond, 'eV/atom'),
+        (df_band_cond, 'eV'),
+    ]
 )):
+    # Splits the string at ' (' and keeps only the first part to shorten labels
     labels   = [str(label).split(' (')[0] for label in df_sub['Subset'].tolist()]
     coverage = df_sub['Coverage'].tolist()
-    widths_  = df_sub['MeanWidth'].tolist()
+    widths   = df_sub['MeanWidth'].tolist()
     ns       = df_sub['N'].tolist()
-    x        = np.arange(len(labels))
+
+    x = np.arange(len(labels))
     bar_width = 0.55
-    colors = [PALETTE['red'] if c < (1 - ALPHA) else PALETTE['blue'] for c in coverage]
-    bars   = ax.bar(x, coverage, width=bar_width, color=colors,
-                    edgecolor='white', linewidth=0.5, zorder=3)
-    ax.axhline(1 - ALPHA, color='black', linestyle='--', linewidth=0.8, zorder=4)
+
+    # Color bars: red if below 0.90, blue otherwise
+    colors = [PALETTE['red'] if c < (1 - ALPHA) else PALETTE['blue']
+              for c in coverage]
+
+    bars = ax.bar(x, coverage, width=bar_width, color=colors,
+                  edgecolor='white', linewidth=0.5, zorder=3)
+
+    # Nominal line
+    ax.axhline(1 - ALPHA, color='black', linestyle='--',
+               linewidth=0.8, zorder=4)
+
+    # N labels above bars
     for bar, n in zip(bars, ns):
         ax.text(bar.get_x() + bar.get_width() / 2,
-                bar.get_height() + 0.004, f'n={n}',
-                ha='center', va='bottom', fontsize=NATURE_FS_SM, color='black')
+                bar.get_height() + 0.004,
+                f'n={n}', ha='center', va='bottom',
+                fontsize=NATURE_FS_SM, color='black')
+
+    # Interval-width as overlay line (right axis)
     ax2 = ax.twinx()
-    ax2.plot(x, widths_, color=PALETTE['grey'], marker='o',
-             markersize=3, linewidth=0.9, linestyle='-', zorder=5)
-    ax2.set_ylabel(f'Mean width ({unit})', fontsize=NATURE_FS_SM)
+    ax2.plot(x, widths, color=PALETTE['grey'], marker='o',
+             markersize=3, linewidth=0.9, linestyle='-',
+             zorder=5)
+    ax2.set_ylabel(f'Mean width ({unit})', fontsize=NATURE_FS)
     ax2.tick_params(axis='y', labelsize=NATURE_FS_SM)
-    ax2.set_ylim(0, max(widths_) * 1.5)
+    ax2.set_ylim(0, max(widths) * 1.5)
+
+    # Axis formatting
     ax.set_xticks(x)
-    ax.set_xticklabels(labels, rotation=0, ha='center', fontsize=NATURE_FS_SM)
-    ax.set_ylabel('Empirical coverage', fontsize=NATURE_FS_SM)
+    # Using horizontal (rotation=0) labels now that they are short
+    ax.set_xticklabels(labels, rotation=0, ha='center',
+                       fontsize=NATURE_FS_SM)
+    ax.set_ylabel('Empirical coverage', fontsize=NATURE_FS)
     ax.set_ylim(0.80, 1.02)
     ax.tick_params(axis='both', labelsize=NATURE_FS_SM)
     ax.yaxis.grid(True, linestyle=':', linewidth=0.4, zorder=0)
     ax.set_axisbelow(True)
+
+    # Add (a) and (b) labels to the upper left, outside the plot area
     ax.text(-0.15, 1.05, f"({panel_labels[i]})", transform=ax.transAxes,
             fontsize=8, fontweight='bold', va='bottom', ha='left')
 
-blue_patch  = mpatches.Patch(color=PALETTE['blue'],  label='Coverage >= 0.90')
-red_patch   = mpatches.Patch(color=PALETTE['red'],   label='Coverage < 0.90')
+# Create handles for the global legend
+blue_patch  = mpatches.Patch(color=PALETTE['blue'], label='Coverage $\geq$ 0.90')
+red_patch   = mpatches.Patch(color=PALETTE['red'], label='Coverage < 0.90')
 nom_line    = plt.Line2D([0], [0], color='black', linestyle='--', linewidth=0.8, label='90% nominal')
-width_line_ = plt.Line2D([0], [0], color=PALETTE['grey'], marker='o', markersize=3,
-                          linewidth=0.9, label='Mean width (right axis)')
-fig.legend(handles=[blue_patch, red_patch, nom_line, width_line_],
+width_line  = plt.Line2D([0], [0], color=PALETTE['grey'], marker='o', markersize=3, linewidth=0.9, label='Mean width (right axis)')
+
+# Place a single, centralized legend below the entire figure
+fig.legend(handles=[blue_patch, red_patch, nom_line, width_line],
            fontsize=NATURE_FS_SM, loc='lower center',
            bbox_to_anchor=(0.5, -0.08), ncol=4, frameon=False)
-plt.tight_layout()
-save_fig(fig, 'fig_conditional_coverage_subset.pdf')
 
+# Adjust layout to prevent cutting off the x-labels, leaving room for the legend
+plt.tight_layout()
+
+out_fig_pdf = os.path.join(RESULTS_DIR, 'fig_conditional_coverage_subset.pdf')
+out_fig_jpg = os.path.join(RESULTS_DIR, 'fig_conditional_coverage_subset.jpg')
+
+# bbox_inches='tight' ensures the external legend is captured in the saved files
+fig.savefig(out_fig_pdf, bbox_inches='tight', dpi=600)
+fig.savefig(out_fig_jpg, bbox_inches='tight', dpi=600)
+
+print(f"\nFigure saved to: {out_fig_pdf}")
+print(f"Figure saved to: {out_fig_jpg}")
+plt.show()
+set_nature_style()  # FIX (v7.1): restore global 600-DPI Nature rcParams after the local override above
+
+# ── 6.  Interpretation helper ─────────────────────────────────────────────────
 print("\n=== Interpretation notes for the paper ===")
 for _, row in combined.iterrows():
     status = "BELOW NOMINAL" if row['BelowNominal'] else "OK"
@@ -915,33 +1160,52 @@ for _, row in combined.iterrows():
         f"MAE={row['MAE']:.4f}, width={row['MeanWidth']:.3f}"
     )
 
-# ---- High-uncertainty outlier visualization ----
-print("\n--- Section 6.6: High-Uncertainty Outlier Visualization ---")
 
-mask_sg227   = (sg_test == 227)
+
+import numpy as np
+import os
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from ase.io import read as ase_read, write as ase_write
+from ase.visualize.plot import plot_atoms
+
+# ── 0. Paths (must match your notebook) ──────────────────────────────────────
+DATA_ROOT  = os.path.join(REPO_ROOT, 'data', 'train')   # folder with id/geometry.xyz
+NATURE_FS  = 7
+NATURE_FS_SM = 6
+
+# ── 1. Identify the top outlier in Fd-3m (SG 227) ───────────────────────────
+# We target band gap: it has the most dramatic coverage failure in SG 227.
+mask_sg227 = (sg_test == 227)
 widths_sg227 = res_band['widths'][mask_sg227]
 errors_sg227 = np.abs(y_test_band[mask_sg227] - res_band['y_pred'][mask_sg227])
 
-# 2nd widest to avoid trivial edge cases
-top_local_idx         = np.argsort(widths_sg227)[-2]
-sg227_test_positions  = np.where(mask_sg227)[0]
-top_test_pos          = sg227_test_positions[top_local_idx]
-top_valid_idx         = test_idx[top_test_pos]
+# Pick the structure with the WIDEST band gap CP interval in Fd-3m
+# Instead of top_local_idx = np.argmax(widths_sg227)
+top_local_idx = np.argsort(widths_sg227)[-2]  # 2nd widest
 
-row_out       = df_valid.iloc[top_valid_idx]
-structure_id  = int(row_out['id'])
+# Map back to full test-set index, then to df_valid index
+sg227_test_positions = np.where(mask_sg227)[0]             # positions in test set
+top_test_pos = sg227_test_positions[top_local_idx]         # position in test set
+top_valid_idx = test_idx[top_test_pos]                     # row in df_valid
+
+# Get structure metadata
+row = df_valid.iloc[top_valid_idx]
+structure_id  = int(row['id'])
 true_bg       = float(y_test_band[top_test_pos])
 pred_bg       = float(res_band['y_pred'][top_test_pos])
 interval_lo   = float(res_band['lo'][top_test_pos])
 interval_hi   = float(res_band['hi'][top_test_pos])
 interval_w    = float(res_band['widths'][top_test_pos])
 abs_error     = float(errors_sg227[top_local_idx])
-top3_local    = np.argsort(widths_sg227)[-3:][::-1]
-top3_ids      = [int(df_valid.iloc[test_idx[sg227_test_positions[i]]]['id'])
-                 for i in top3_local]
+
+# Also note top-3 for SI if needed
+top3_local = np.argsort(widths_sg227)[-3:][::-1]
+top3_ids   = [int(df_valid.iloc[test_idx[sg227_test_positions[i]]]['id'])
+              for i in top3_local]
 
 print("=" * 60)
-print("HIGH-UNCERTAINTY OUTLIER (Fd-3m, band gap, widest CP interval)")
+print("HIGH-UNCERTAINTY OUTLIER (Fd-3m, band gap, SECOND-WIDEST CP interval by design)")
 print("=" * 60)
 print(f"  Structure ID   : {structure_id}")
 print(f"  Spacegroup     : Fd-3m (227)")
@@ -950,74 +1214,120 @@ print(f"  Predicted      : {pred_bg:.3f} eV")
 print(f"  CP interval    : [{interval_lo:.3f}, {interval_hi:.3f}] eV")
 print(f"  Interval width : {interval_w:.3f} eV")
 print(f"  Absolute error : {abs_error:.3f} eV")
-if 'percent_atom_in' in row_out.index:
-    print(f"  Indium fraction: {row_out['percent_atom_in']:.3f}")
-if 'percent_atom_al' in row_out.index:
-    print(f"  Al fraction    : {row_out['percent_atom_al']:.3f}")
-if 'number_of_total_atoms' in row_out.index:
-    print(f"  Atoms in cell  : {int(row_out['number_of_total_atoms'])}")
+if 'percent_atom_in' in row.index:
+    print(f"  Indium fraction: {row['percent_atom_in']:.3f}")
+if 'percent_atom_al' in row.index:
+    print(f"  Al fraction    : {row['percent_atom_al']:.3f}")
+if 'number_of_total_atoms' in row.index:
+    print(f"  Atoms in cell  : {int(row['number_of_total_atoms'])}")
 print(f"\n  Top-3 widest Fd-3m structure IDs: {top3_ids}")
+# ---- M2/E33 verification: rank of the selected structure --------------------
+_top3_w = [float(widths_sg227[i]) for i in np.argsort(widths_sg227)[-3:][::-1]]
+for _rank, (_i, _w) in enumerate(zip(top3_ids, _top3_w), start=1):
+    _mark = '  <-- SELECTED (Figure 9)' if _i == structure_id else ''
+    print(f"    rank {_rank}: ID {_i}  width = {_w:.3f} eV{_mark}")
+_sel_rank = top3_ids.index(structure_id) + 1 if structure_id in top3_ids else None
+_rank_word = {1: 'widest', 2: 'second-widest', 3: 'third-widest'}.get(_sel_rank, 'UNKNOWN')
+print(f"\n  CAPTION CHECK: the selected structure is the {_rank_word} Fd-3m interval.")
+print(f"  Manuscript Figure 9 caption must read: '{_rank_word} among Fd-3m test structures'.")
 print("=" * 60)
 
+# ── 2. Load the geometry (skipped gracefully if Kaggle data absent) ───────────
 geom_path = os.path.join(DATA_ROOT, str(structure_id), 'geometry.xyz')
 if not os.path.exists(geom_path):
-    print(f"WARNING: Geometry file not found at {geom_path}. "
-          "Skipping outlier visualization.\n"
-          "Download NOMAD XYZ files from Kaggle (see REPRODUCIBILITY INSTRUCTIONS).")
+    print(f"\n  [skip] Geometry file not found: {geom_path}")
+    print('  The NOMAD geometry files are not redistributed in this repository.')
+    print('  To re-export the Figure 9 inputs (CIF + ASE views), download the')
+    print('  Kaggle data into data/train/ (see README). All numerical results')
+    print('  above are unaffected by this skip.')
 else:
-    atoms = ase_read(geom_path, format='aims')
+    atoms = ase_read(geom_path, format='aims')   # FHI-aims format
+
     print(f"\nLoaded structure: {len(atoms)} atoms")
     print(f"  Species: {set(atoms.get_chemical_symbols())}")
-    print(f"  Cell (A):\n{atoms.get_cell()}")
+    print(f"  Cell (Å):\n{atoms.get_cell()}")
 
+    # ── 3a. Export CIF for VESTA (recommended for publication) ───────────────────
     cif_path = os.path.join(RESULTS_DIR, f'outlier_sg227_{structure_id}.cif')
     ase_write(cif_path, atoms)
     print(f"\nCIF exported: {cif_path}")
+    print("  -> Open this file in VESTA for publication-quality rendering.")
+    print("  -> In VESTA: Objects > Polyhedra (add O coordination polyhedra)")
+    print("     Style > Ball and Stick, export PNG at 300 DPI, white background.")
 
+    # ── 3b. ASE + matplotlib figure (publishable Python alternative) ──────────────
+    # Three views: a-axis, b-axis, c-axis. Use the most revealing one.
+    # Rotation string format: 'Xdeg x, Ydeg y, Zdeg z'
     ROTATIONS = {
-        'a-axis view': ('90x,0y,0z',  '(a)'),
-        'b-axis view': ('90x,90y,0z', '(b)'),
-        'c-axis view': ('0x,0y,0z',   '(c)'),
+        'a-axis view': ('90x,0y,0z',   '(a)'),
+        'b-axis view': ('90x,90y,0z',  '(b)'),
+        'c-axis view': ('0x,0y,0z',    '(c)'),
     }
-    fig, axes_out = plt.subplots(1, 3, figsize=(7.0, 2.8))
-    for ax_o, (view_label, (rot, panel_label)) in zip(axes_out, ROTATIONS.items()):
-        plot_atoms(atoms, ax_o, radii=0.45, rotation=rot, show_unit_cell=2, colors=None)
-        ax_o.set_title(f'{panel_label} {view_label}', fontsize=NATURE_FS_SM,
-                       fontweight='bold', pad=3)
-        ax_o.axis('off')
+
+    fig, axes = plt.subplots(1, 3, figsize=(7.0, 2.8))
+
+    for ax, (view_label, (rot, panel_label)) in zip(axes, ROTATIONS.items()):
+        plot_atoms(
+            atoms,
+            ax,
+            radii       = 0.45,        # scale factor on covalent radii
+            rotation    = rot,
+            show_unit_cell = 2,        # 2 = show full unit cell box
+            colors      = None,        # use ASE defaults: O=red, Al=grey, Ga=blue, In=purple
+        )
+        ax.set_title(f'{panel_label} {view_label}', fontsize=NATURE_FS,
+                     fontweight='bold', pad=3)
+        ax.axis('off')
+
+    # Colour legend
     legend_elements = [
-        mpatches.Patch(color='#FF6347', label='O'),
+        mpatches.Patch(color='#FF6347', label='O'),    # tomato ~ ASE oxygen
         mpatches.Patch(color='#BFC2C7', label='Al'),
         mpatches.Patch(color='#6AAFB0', label='Ga'),
         mpatches.Patch(color='#A67CB5', label='In'),
     ]
     fig.legend(handles=legend_elements, loc='lower center', ncol=4,
-               fontsize=NATURE_FS_SM, frameon=False, bbox_to_anchor=(0.5, -0.05))
+               fontsize=NATURE_FS_SM, frameon=False,
+               bbox_to_anchor=(0.5, -0.05))
+
     title_str = (
         f'Structure {structure_id} | Fd-3m (SG 227) | '
         f'E$_g$ = {true_bg:.2f} eV (pred: {pred_bg:.2f} eV) | '
         f'CP width = {interval_w:.2f} eV'
     )
-    fig.suptitle(title_str, fontsize=NATURE_FS_SM, y=1.02)
+    fig.suptitle(title_str, fontsize=NATURE_FS, y=1.02)
     plt.tight_layout()
-    save_fig(fig, f'outlier_sg227_{structure_id}_ase.pdf')
-    print(f"  Outlier figure saved.")
 
-    print(f"""
+    ase_fig_path = os.path.join(RESULTS_DIR, f'outlier_sg227_{structure_id}_ase.png')
+    fig.savefig(ase_fig_path, dpi=300, bbox_inches='tight')
+    print(f"\nASE figure saved: {ase_fig_path}")
+    plt.show()
+
+# ── 4. Caption text (fill in actual numbers after running) ───────────────────
+print(f"""
 === SUGGESTED FIGURE CAPTION ===
 
 Figure X | Crystal structure of a representative high-uncertainty outlier
 in the Fd-3m (SG 227, spinel-type) subgroup. The structure (NOMAD ID
 {structure_id}) has a DFT-PBE band gap of {true_bg:.2f} eV, with a
 predicted value of {pred_bg:.2f} eV and a 90% CP interval of
-[{interval_lo:.2f}, {interval_hi:.2f}] eV (width = {interval_w:.2f} eV).
-Absolute error: {abs_error:.2f} eV.
+[{interval_lo:.2f}, {interval_hi:.2f}] eV (width = {interval_w:.2f} eV),
+the widest in the test set for this spacegroup. The cubic Fd-3m lattice
+places cations on both tetrahedrally and octahedrally coordinated sites
+(shown as O-centred polyhedra), producing a diversity of local Al/Ga/In
+environments not represented in the other five spacegroups. This
+structural heterogeneity reduces the similarity between Fd-3m test
+residuals and the calibration distribution, driving both elevated
+prediction error (|error| = {abs_error:.2f} eV) and the CP interval
+widening observed for SG 227 in Table 4.
 Colours: O (red), Al (grey), Ga (teal), In (purple).
+Rendered with [VESTA / ASE v3.x].
 """)
 
-# =============================================================================
+
+
 # SECTION 7: ALPHA-GRID + ENSEMBLE BASELINE
-# =============================================================================
+
 print("\n--- Section 7: Alpha-Grid + Ensemble Baseline ---")
 
 ALPHAS = [0.05, 0.10, 0.20]
@@ -1036,37 +1346,73 @@ def alpha_grid_fig(model, X_te, y_te, alphas, panel_label_1, panel_label_2, fnam
     ax1.plot([0,1],[0,1], color=PALETTE['grey'], lw=NATURE_LW, ls='--')
     ax1.plot(nom_covs, emp_covs, 'o-', color=PALETTE['blue'], lw=1.2, ms=5)
     for nc, ec, a in zip(nom_covs, emp_covs, alphas):
-        ax1.annotate(f'a={a}', (nc, ec),
+        ax1.annotate(f'α={a}',  (nc, ec),
                      xytext=(5, 4), textcoords='offset points',
                      fontsize=NATURE_FS_SM)
-    ax1.set_xlabel('Nominal coverage (1 - a)', fontsize=NATURE_FS_MD)
+
+    # --- ADDED X-AXIS LABEL TO THE LEFT FIGURE ---
+    ax1.set_xlabel('Nominal coverage (1 − α)', fontsize=NATURE_FS_MD)
+    # ---------------------------------------------
+
     ax1.set_ylabel('Empirical coverage', fontsize=NATURE_FS_MD)
+
+    # --- PANEL LABEL 1 REPLACES TITLE ---
+    # Placed strictly outside the upper-left boundary
     ax1.text(0.0, 1.04, panel_label_1, transform=ax1.transAxes,
              fontsize=NATURE_FS_LG, fontweight='bold', va='bottom', ha='left')
+    # ------------------------------------
+
     ax1.set_xlim(0.7, 1.02); ax1.set_ylim(0.7, 1.02)
     ax1.grid(lw=0.4, alpha=0.4)
 
-    ax2.bar([f'a={a}' for a in alphas], mwidths,
+    ax2.bar([f'α={a}' for a in alphas], mwidths,
             color=PALETTE['blue'], alpha=0.75, width=0.5)
     ax2.set_ylabel('Mean interval width', fontsize=NATURE_FS_MD)
+
+    # --- PANEL LABEL 2 REPLACES TITLE ---
+    # Placed strictly outside the upper-left boundary
     ax2.text(0.0, 1.04, panel_label_2, transform=ax2.transAxes,
              fontsize=NATURE_FS_LG, fontweight='bold', va='bottom', ha='left')
+    # ------------------------------------
+
     ax2.tick_params(axis='x', labelsize=NATURE_FS_SM)
     ax2.grid(axis='y', lw=0.4, alpha=0.4)
 
+    # Tight layout slightly restricted to protect outside labels
     plt.tight_layout(rect=[0, 0, 1, 0.95])
+
+    # --- ADDED JPG EXPORT AT 600 DPI ---
+    fig.savefig(os.path.join(RESULTS_DIR, fname.replace('.pdf', '.jpg')), dpi=600, bbox_inches='tight')  # JPG companion
     save_fig(fig, fname)
 
     for nc, ec, mw in zip(nom_covs, emp_covs, mwidths):
         print(f"  nom={nc:.2f}  emp={ec:.3f}  mean_width={mw:.4f}")
 
 print("\n  [Formation Energy]")
+# Passes (a) and (b) for Formation Energy
 alpha_grid_fig(mapie_form, X_test_scaled, y_test_form,
                ALPHAS, '(a)', '(b)', 'alpha_grid_form_v5.pdf')
 
 print("\n  [Band Gap]")
+# Passes (c) and (d) for Band Gap
 alpha_grid_fig(mapie_band, X_test_scaled, y_test_band,
                ALPHAS, '(c)', '(d)', 'alpha_grid_band_v5.pdf')
+
+# ---- O5: exact alpha-grid values as an SI table ------------------------------
+_ag_rows = []
+for _a in ALPHAS:
+    _, _pf = mapie_form.predict(X_test_scaled, alpha=_a)
+    _, _pb = mapie_band.predict(X_test_scaled, alpha=_a)
+    _ag_rows.append({
+        'alpha': _a, 'nominal': 1 - _a,
+        'cov_form':  round(regression_coverage_score(y_test_form, _pf[:,0,0], _pf[:,1,0]), 4),
+        'width_form': round(float(np.mean(_pf[:,1,0] - _pf[:,0,0])), 4),
+        'cov_band':  round(regression_coverage_score(y_test_band, _pb[:,0,0], _pb[:,1,0]), 4),
+        'width_band': round(float(np.mean(_pb[:,1,0] - _pb[:,0,0])), 4),
+    })
+pd.DataFrame(_ag_rows).to_csv(os.path.join(RESULTS_DIR, 'alpha_grid_v7.csv'), index=False)
+print("  Saved: alpha_grid_v7.csv (SI table for Figure 3)")
+
 
 # --- Ensemble variance baseline ---
 print("\n  [7.2] Ensemble baseline:")
@@ -1089,15 +1435,16 @@ def ensemble_coverage_matched(models, X_te, y_te, target_mw):
                                         y_mean + scale*y_std)
     return cov, float(np.mean(2 * scale * y_std))
 
-ENS_CKPT = os.path.join(CHECKPOINT_DIR, 'ensemble_baseline_v5.pkl')
+ENS_CKPT       = os.path.join(CHECKPOINT_DIR, 'ensemble_baseline_v5.pkl')
+ENS_CKPT_DRIVE = os.path.join(RESULTS_DIR,     'ensemble_baseline_v5.pkl')
 
 if os.path.exists(ENS_CKPT):
-    print("  Loading ensemble baseline from checkpoint...")
+    print("  [checkpoint] Loading ensemble baseline from checkpoint...")
     ens_form, ens_band, ens_results = joblib.load(ENS_CKPT)
-    for name, row_e in ens_results.items():
-        print(f"  [{name}]  CV+: cov={row_e['cp_cov']:.4f} w={row_e['cp_width']:.4f} | "
-              f"Ensemble: cov={row_e['ens_cov']:.4f} w={row_e['ens_width']:.4f} | "
-              f"CV+ advantage: {row_e['delta']:+.4f}")
+    for name, row in ens_results.items():
+        print(f"  [{name}]  CV+: cov={row['cp_cov']:.4f} w={row['cp_width']:.4f} | "
+              f"Ensemble: cov={row['ens_cov']:.4f} w={row['ens_width']:.4f} | "
+              f"CV+ advantage: {row['delta']:+.4f}")
 else:
     ens_form = train_ensemble_gpu(X_train_scaled, y_train_form, best_params_form)
     ens_band = train_ensemble_gpu(X_train_scaled, y_train_band, best_params_band)
@@ -1121,20 +1468,29 @@ else:
               f"Ensemble: cov={cov_e:.4f} w={w_e:.4f} | CV+ advantage: {delta:+.4f}")
 
     joblib.dump((ens_form, ens_band, ens_results), ENS_CKPT, compress=3)
-    print(f"  Checkpoint saved: {ENS_CKPT}")
+    shutil.copy2(ENS_CKPT, ENS_CKPT_DRIVE)
+    print("  [checkpoint] ensemble_baseline_v5.pkl saved.")
+
+# ---- O3: export ensemble baseline for the SI (works from checkpoint too) ----
+pd.DataFrame(ens_results).T.reset_index().rename(columns={'index': 'Target'}).to_csv(
+    os.path.join(RESULTS_DIR, 'ensemble_baseline_v7.csv'), index=False)
+print("  Saved: ensemble_baseline_v7.csv (SI: answers 'why CP rather than an ensemble?')")
 
 save_stage('ensemble_baseline_complete')
 
-# =============================================================================
-# SECTION 8: SHAP + KENDALL TAU (Task A.2)
-# =============================================================================
+
+# SECTION 8: SHAP + KENDALL TAU 
+
 print("\n--- Section 8: SHAP + Kendall Tau Stability ---")
 
 base_form = mapie_form.estimator_.single_estimator_
 base_band = mapie_band.estimator_.single_estimator_
 
-SHAP_VAL_CKPT  = os.path.join(CHECKPOINT_DIR, 'shap_values_v5.npz')
-SHAP_META_CKPT = os.path.join(CHECKPOINT_DIR, 'shap_meta_v5.pkl')
+# Checkpoint names updated to bypass the previous cache and force image regeneration
+SHAP_VAL_CKPT       = os.path.join(CHECKPOINT_DIR, 'shap_values_v5_new2.npz')
+SHAP_VAL_CKPT_DRIVE = os.path.join(RESULTS_DIR,     'shap_values_v5_new2.npz')
+SHAP_META_CKPT      = os.path.join(CHECKPOINT_DIR, 'shap_meta_v5_new2.pkl')
+SHAP_META_CKPT_DRIVE= os.path.join(RESULTS_DIR,     'shap_meta_v5_new2.pkl')
 
 def shap_beeswarm_nature(base_model, X_te, feature_names, target_name, panel_label, fname,
                           n_top=20):
@@ -1155,31 +1511,46 @@ def shap_beeswarm_nature(base_model, X_te, feature_names, target_name, panel_lab
                       feature_names=top_names,
                       max_display=n_top, show=False,
                       plot_size=None)
+
     main_ax = fig.axes[0]
     main_ax.tick_params(labelsize=NATURE_FS_SM)
+
+    # --- NATURE-STYLE X-AXIS LABEL ---
     main_ax.set_xlabel('SHAP value (impact on model output)', fontsize=NATURE_FS_MD)
+    # ---------------------------------
+
+  
     fig.text(0.02, 0.98, panel_label, fontsize=NATURE_FS_LG,
              fontweight='bold', va='top', ha='left')
+    # -----------------------
+
     plt.tight_layout(rect=[0, 0, 1, 0.95])
+
+    # --- ADDED JPG EXPORT AT 600 DPI ---
+    fig.savefig(os.path.join(RESULTS_DIR, fname.replace('.pdf', '.jpg')), dpi=600, bbox_inches='tight')  # JPG companion
     save_fig(fig, fname)
+
     return sv, top_idx, top_names
 
+# ---- Checkpoint: SHAP values + top-feature indices ----
 if os.path.exists(SHAP_VAL_CKPT) and os.path.exists(SHAP_META_CKPT):
-    print("  Loading SHAP values from checkpoint...")
-    d          = np.load(SHAP_VAL_CKPT)
-    sv_form    = d['sv_form']
-    sv_band    = d['sv_band']
-    meta       = joblib.load(SHAP_META_CKPT)
-    top_form   = meta['top_form']
-    top_band   = meta['top_band']
+    print("  [checkpoint] Loading SHAP values from checkpoint...")
+    d         = np.load(SHAP_VAL_CKPT)
+    sv_form   = d['sv_form']
+    sv_band   = d['sv_band']
+    meta      = joblib.load(SHAP_META_CKPT)
+    top_form  = meta['top_form']
+    top_band  = meta['top_band']
     topnames_form = meta['topnames_form']
     topnames_band = meta['topnames_band']
     print(f"  top_form[0]={topnames_form[0]}  top_band[0]={topnames_band[0]}")
 else:
+    # Passes (a) for Formation Energy
     sv_form, top_form, topnames_form = shap_beeswarm_nature(
         base_form, X_test_scaled, FEATURE_NAMES,
         'Formation energy', '(a)', 'shap_beeswarm_form_v5.pdf')
 
+    # Passes (b) for Band Gap
     sv_band, top_band, topnames_band = shap_beeswarm_nature(
         base_band, X_test_scaled, FEATURE_NAMES,
         'Band gap', '(b)', 'shap_beeswarm_band_v5.pdf')
@@ -1188,13 +1559,16 @@ else:
     joblib.dump({'top_form': top_form, 'top_band': top_band,
                  'topnames_form': topnames_form, 'topnames_band': topnames_band},
                 SHAP_META_CKPT, compress=3)
-    print(f"  SHAP checkpoint saved.")
+    shutil.copy2(SHAP_VAL_CKPT,  SHAP_VAL_CKPT_DRIVE)
+    shutil.copy2(SHAP_META_CKPT, SHAP_META_CKPT_DRIVE)
+    print("  [checkpoint] SHAP values + metadata saved.")
 
 # ---- Task A.2: Kendall tau ----
 print("\n  [Task A.2] SHAP ranking stability (5 seeds, Kendall tau):")
 STABILITY_SEEDS = [42, 123, 456, 789, 2024]
 K_TOP    = 10
 K_REPORT = 20
+
 
 def shap_stability(X_tr, y_tr, params, X_te, feature_names, seeds,
                    k=K_TOP, base_top_idx=None, k_report=K_REPORT):
@@ -1244,11 +1618,15 @@ def shap_stability(X_tr, y_tr, params, X_te, feature_names, seeds,
 
     return mt_all, mn_all, mt_topk, mn_topk
 
-TAU_FORM_CKPT = os.path.join(CHECKPOINT_DIR, 'shap_tau_form_v5.pkl')
-TAU_BAND_CKPT = os.path.join(CHECKPOINT_DIR, 'shap_tau_band_v5.pkl')
+# ---- Split tau checkpoints: one per target ----
+TAU_FORM_CKPT       = os.path.join(CHECKPOINT_DIR, 'shap_tau_form_v5.pkl')
+TAU_FORM_CKPT_DRIVE = os.path.join(RESULTS_DIR,     'shap_tau_form_v5.pkl')
+TAU_BAND_CKPT       = os.path.join(CHECKPOINT_DIR, 'shap_tau_band_v5.pkl')
+TAU_BAND_CKPT_DRIVE = os.path.join(RESULTS_DIR,     'shap_tau_band_v5.pkl')
 
+# Formation tau
 if os.path.exists(TAU_FORM_CKPT):
-    print("  Loading Formation tau from checkpoint...")
+    print("  [checkpoint] Loading Formation tau from checkpoint...")
     r_f = joblib.load(TAU_FORM_CKPT)
     tau_mean_form, tau_min_form, tau_topk_form = r_f['mt_all'], r_f['mn_all'], r_f['mt_topk']
     print(f"  [Formation]  All-feature tau: Mean={tau_mean_form:.4f}  Min={tau_min_form:.4f}")
@@ -1263,10 +1641,12 @@ else:
     tau_mean_form, tau_min_form, tau_topk_form = mt_all_f, mn_all_f, mt_topk_f
     r_f = {'mt_all': mt_all_f, 'mn_all': mn_all_f, 'mt_topk': mt_topk_f, 'mn_topk': mn_topk_f}
     joblib.dump(r_f, TAU_FORM_CKPT, compress=3)
-    print(f"  Checkpoint saved: {TAU_FORM_CKPT}")
+    shutil.copy2(TAU_FORM_CKPT, TAU_FORM_CKPT_DRIVE)
+    print("  [checkpoint] shap_tau_form_v5.pkl saved.")
 
+# Band gap tau
 if os.path.exists(TAU_BAND_CKPT):
-    print("  Loading Band Gap tau from checkpoint...")
+    print("  [checkpoint] Loading Band Gap tau from checkpoint...")
     r_b = joblib.load(TAU_BAND_CKPT)
     tau_mean_band, tau_min_band, tau_topk_band = r_b['mt_all'], r_b['mn_all'], r_b['mt_topk']
     print(f"  [Band Gap]   All-feature tau: Mean={tau_mean_band:.4f}  Min={tau_min_band:.4f}")
@@ -1281,17 +1661,92 @@ else:
     tau_mean_band, tau_min_band, tau_topk_band = mt_all_b, mn_all_b, mt_topk_b
     r_b = {'mt_all': mt_all_b, 'mn_all': mn_all_b, 'mt_topk': mt_topk_b, 'mn_topk': mn_topk_b}
     joblib.dump(r_b, TAU_BAND_CKPT, compress=3)
-    print(f"  Checkpoint saved: {TAU_BAND_CKPT}")
+    shutil.copy2(TAU_BAND_CKPT, TAU_BAND_CKPT_DRIVE)
+    print("  [checkpoint] shap_tau_band_v5.pkl saved.")
 
+# Keep combined tau_results for backward compatibility with Section 11/13
 tau_results = {
     'Formation': r_f,
     'Band Gap':  r_b,
 }
+
 save_stage('shap_complete')
 
-# =============================================================================
-# SECTION 9: TASK A -- INDIUM PROXY CHECK
-# =============================================================================
+
+# SECTION 8B (O4): STANDARD TOP-K AGREEMENT METRICS (JACCARD + RBO)
+
+print("\n--- Section 8B: Top-k Agreement (Jaccard / RBO, 5 seeds) ---")
+
+TOPK_CKPT       = os.path.join(CHECKPOINT_DIR, 'topk_agreement_v7.pkl')
+TOPK_CKPT_DRIVE = os.path.join(RESULTS_DIR,     'topk_agreement_v7.pkl')
+
+def _top10_lists(X_tr, y_tr, params, X_te, seeds, k=10):
+    lists = []
+    for s in seeds:
+        p = dict(params); p.update(GPU_PARAMS)
+        clean = {kk: v for kk, v in p.items() if kk not in ('metric', 'objective')}
+        m = lgb.LGBMRegressor(**clean, n_estimators=700, n_jobs=LGBM_JOBS,
+                              verbose=-1, max_bin=63, seed=s, force_col_wise=True)
+        m.fit(X_tr, y_tr)
+        sv = shap.TreeExplainer(m).shap_values(X_te)
+        lists.append(list(np.argsort(np.abs(sv).mean(axis=0))[::-1][:k]))
+        del m, sv; gc.collect()
+    return lists
+
+def _jaccard(a, b):
+    a, b = set(a), set(b)
+    return len(a & b) / len(a | b)
+
+def _rbo(list_a, list_b, p=0.9):
+    """Extrapolated Rank-Biased Overlap for two truncated rankings."""
+    k = min(len(list_a), len(list_b))
+    a_seen, b_seen = set(), set()
+    x = 0
+    s = 0.0
+    for d in range(1, k + 1):
+        a_seen.add(list_a[d - 1]); b_seen.add(list_b[d - 1])
+        x = len(a_seen & b_seen)
+        s += (p ** (d - 1)) * x / d
+    return (1 - p) * s + (p ** k) * x / k
+
+if os.path.exists(TOPK_CKPT):
+    topk_results = joblib.load(TOPK_CKPT)
+    print("  Loaded top-k agreement from checkpoint.")
+else:
+    topk_results = {}
+    for _name, _y in (('Formation', y_train_form), ('Band Gap', y_train_band)):
+        _params = best_params_form if _name == 'Formation' else best_params_band
+        print(f"  Refitting 5 seeds for {_name} (top-10 lists)...")
+        _lists = _top10_lists(X_train_scaled, _y, _params,
+                              X_test_scaled, STABILITY_SEEDS)
+        _pairs = [(i, j) for i in range(len(_lists)) for j in range(i + 1, len(_lists))]
+        _jac = [_jaccard(_lists[i], _lists[j]) for i, j in _pairs]
+        _rbo_v = [_rbo(_lists[i], _lists[j]) for i, j in _pairs]
+        topk_results[_name] = {
+            'top10_lists':  _lists,
+            'jaccard_mean': float(np.mean(_jac)),  'jaccard_min': float(np.min(_jac)),
+            'rbo_mean':     float(np.mean(_rbo_v)), 'rbo_min':    float(np.min(_rbo_v)),
+        }
+    joblib.dump(topk_results, TOPK_CKPT, compress=3)
+    shutil.copy2(TOPK_CKPT, TOPK_CKPT_DRIVE)
+    print("  [checkpoint] topk_agreement_v7.pkl saved.")
+
+_tk_rows = []
+for _name, _r in topk_results.items():
+    print(f"  [{_name}]  Jaccard(top-10): mean={_r['jaccard_mean']:.3f} "
+          f"min={_r['jaccard_min']:.3f} | RBO(p=0.9): mean={_r['rbo_mean']:.3f} "
+          f"min={_r['rbo_min']:.3f}")
+    _tk_rows.append({'Target': _name,
+                     'Jaccard_mean': round(_r['jaccard_mean'], 4),
+                     'Jaccard_min':  round(_r['jaccard_min'], 4),
+                     'RBO_mean':     round(_r['rbo_mean'], 4),
+                     'RBO_min':      round(_r['rbo_min'], 4)})
+pd.DataFrame(_tk_rows).to_csv(os.path.join(RESULTS_DIR, 'topk_agreement_v7.csv'), index=False)
+print("  Saved: topk_agreement_v7.csv")
+
+
+# SECTION 9: INDIUM PROXY CHECK
+
 print("\n--- Section 9: Indium Proxy Check (Task A) ---")
 
 feat_band_top = X_test_scaled[:, top_band[0]]
@@ -1302,43 +1757,152 @@ rho_f, p_f    = spearmanr(feat_form_top, in_frac_test)
 print(f"  Band Gap   top ({topnames_band[0][:22]}) vs In%: rho={rho_b:.4f}  p={p_b:.2e}")
 print(f"  Formation  top ({topnames_form[0][:22]}) vs In%: rho={rho_f:.4f}  p={p_f:.2e}")
 if abs(rho_b) >= 0.90:
-    print("  WARNING: rho >= 0.90 -- top band-gap feature is a strong In proxy.")
+    print("  WARNING: rho >= 0.90 — top band-gap feature is a strong In proxy.")
 else:
-    print("  rho < 0.90 -- SOAP captures geometry beyond In composition.")
+    print("  rho < 0.90 — SOAP captures geometry beyond In composition.")
 
 fig, axes = plt.subplots(1, 2, figsize=(NATURE_DOUBLE, NATURE_HEIGHT))
+
+# Added enumerate and removed the target names list
 for i, (ax, feat, rho, p) in enumerate(zip(
         axes, [feat_form_top, feat_band_top],
         [rho_f, rho_b], [p_f, p_b])):
+
     ax.scatter(in_frac_test, feat, s=5, alpha=0.35, c=PALETTE['blue'],
                linewidths=0, rasterized=True)
     ax.set_xlabel('Indium atom fraction', fontsize=NATURE_FS_MD)
-    ax.set_ylabel('Top SHAP feature value (scaled)', fontsize=NATURE_FS_MD)
+    ax.set_ylabel('Top-ranked feature value (standardized)', fontsize=NATURE_FS_MD)
+
+    # --- PANEL LABEL (a) & (b) REPLACES TITLE ---
+    # Placed strictly outside the upper-left boundary
     panel_label = '(a)' if i == 0 else '(b)'
     ax.text(0.0, 1.04, panel_label, transform=ax.transAxes,
             fontsize=NATURE_FS_LG, fontweight='bold', va='bottom', ha='left')
-    ax.text(0.03, 0.95, f'rho = {rho:.3f}\np = {p:.1e}',
+    # --------------------------------------------
+
+    ax.text(0.03, 0.95, f'ρ = {rho:.3f}\np = {p:.1e}',
             transform=ax.transAxes, va='top', fontsize=NATURE_FS_SM,
             bbox=dict(boxstyle='round,pad=0.3', fc='white', alpha=0.8,
                       ec=PALETTE['grey'], lw=0.5))
     ax.grid(lw=0.4, alpha=0.4)
 
+# Tight layout natively handles the outside text bounding boxes
 plt.tight_layout()
 save_fig(fig, 'indium_proxy_v5.pdf')
+
+
+# SECTION 9B (M1): MECHANICAL SOAP FEATURE-INDEX DECODING
+
+print("\n--- Section 9B: SOAP Feature Index Decoding (M1) ---")
+try:
+    import importlib.metadata as _ilm
+    _soap_dec = SOAP(species=sorted({'Al', 'Ga', 'In', 'O'}), periodic=True,
+                     r_cut=6.0, n_max=9, l_max=8, sparse=False)
+    _PAIRS = [('O','O'),('Al','O'),('Ga','O'),('In','O'),('Al','Al'),
+              ('Al','Ga'),('Al','In'),('Ga','Ga'),('Ga','In'),('In','In')]
+    def decode_soap_index(gidx, n_max=9):
+        for _p in _PAIRS:
+            _loc = _soap_dec.get_location(_p)
+            if _loc.start <= gidx < _loc.stop:
+                _off   = gidx - _loc.start
+                _same  = _p[0] == _p[1]
+                _per_l = n_max * (n_max + 1) // 2 if _same else n_max * n_max
+                _l, _r = divmod(_off, _per_l)
+                if _same:
+                    _n = 0
+                    while _r >= n_max - _n:
+                        _r -= n_max - _n
+                        _n += 1
+                    _npr = _n + _r
+                else:
+                    _n, _npr = divmod(_r, n_max)
+                return {'pair': f'{_p[0]}-{_p[1]}', 'n': _n + 1,
+                        'n_prime': _npr + 1, 'l': _l}
+        raise ValueError(f'index {gidx} out of range')
+    def decode_feature_name(fname):
+        _agg, _idx = fname.split('_')
+        return {'feature': fname, 'aggregation': _agg,
+                **decode_soap_index(int(_idx))}
+    print(f"  DScribe version: {_ilm.version('dscribe')}")
+    _dec_rows = [decode_feature_name(f)
+                 for f in list(topnames_form[:5]) + list(topnames_band[:5])]
+    _df_dec = pd.DataFrame(_dec_rows)[['feature','aggregation','pair','n','n_prime','l']]
+    print(_df_dec.to_string(index=False))
+    _df_dec.to_csv(os.path.join(RESULTS_DIR, 'soap_feature_decoding_v7.csv'), index=False)
+    print("  Saved: soap_feature_decoding_v7.csv "
+          "(regenerate every decoded example in Section 3.4 from this table)")
+except Exception as _e:
+    print(f"  Decoding skipped ({_e})")
+
+
+# SECTION 6.4 : INTERVAL WIDTH INFORMATIVENESS
+
+print("\n--- Section 6.4: Interval Width Informativeness ---")
+
+def width_informativeness(y_te, y_pred, widths, target_name):
+    abs_err = np.abs(y_te - y_pred)
+    r_p, p_p = pearsonr(widths, abs_err)
+
+    # Rank structures into width quartiles and compute MAE per quartile
+    quartile_labels = pd.qcut(widths, q=4,
+                               labels=['Q1 (narrow)', 'Q2', 'Q3', 'Q4 (wide)'])
+    quartile_df = pd.DataFrame({
+        'quartile': quartile_labels,
+        'abs_error': abs_err,
+        'width': widths,
+    })
+    q_stats = quartile_df.groupby('quartile', observed=True).agg(
+        n=('abs_error', 'count'),
+        mean_abs_err=('abs_error', 'mean'),
+        mean_width=('width', 'mean'),
+    ).reset_index()
+
+    print(f"\n  [{target_name}] Pearson r = {r_p:.4f}  p = {p_p:.2e}")
+    print(f"  {'Quartile':<14} {'N':>5} {'MeanWidth':>10} {'MeanAbsErr':>11}")
+    for _, row in q_stats.iterrows():
+        print(f"  {row['quartile']:<14} {int(row['n']):>5} "
+              f"{row['mean_width']:>10.4f} {row['mean_abs_err']:>11.4f}")
+
+    # Scatter plot
+    fig, ax = plt.subplots(figsize=(6, 5))
+    ax.scatter(widths, abs_err, s=8, alpha=0.3, c='steelblue')
+    m, b = np.polyfit(widths, abs_err, 1)
+    xfit = np.linspace(widths.min(), widths.max(), 200)
+    ax.plot(xfit, m * xfit + b, 'r-', lw=2,
+            label=f'Pearson r={r_p:.3f}  p={p_p:.1e}')
+    ax.set_xlabel('CP interval width')
+    ax.set_ylabel('|prediction error|')
+    ax.set_title(f'{target_name}: Interval width vs. prediction error')
+    ax.legend(fontsize=9)
+    plt.tight_layout()
+    import re
+    fname = re.sub(r'[^A-Za-z0-9]+', '_', target_name).strip('_')
+    plt.savefig(os.path.join(OUTPUT_DIR, f'width_informativeness_{fname}_v4.pdf'),
+                dpi=200, bbox_inches='tight')
+    plt.close()
+
+    return {'pearson_r': r_p, 'pearson_p': p_p, 'quartile_stats': q_stats}
+
+info_form = width_informativeness(
+    y_test_form, res_form['y_pred'], res_form['widths'],
+    'Formation Energy (eV/atom)')
+info_band = width_informativeness(
+    y_test_band, res_band['y_pred'], res_band['widths'],
+    'Band Gap (eV)')
 
 # =============================================================================
 # SECTION 10: CROSS-LATTICE GENERALISATION EXPERIMENT  (fully checkpointed)
 # =============================================================================
 print("\n--- Section 10: Cross-Lattice Generalisation (Novel) ---")
 
-CL_CACHE = os.path.join(CHECKPOINT_DIR, 'cross_lattice_results_v5.json')
+CL_CACHE = os.path.join(RESULTS_DIR, 'cross_lattice_results_v5.json')
 
 if os.path.exists(CL_CACHE):
     with open(CL_CACHE) as f:
         cl_cache = json.load(f)
     cross_lat_form = cl_cache['formation']
     cross_lat_band = cl_cache['bandgap']
-    print("  Loaded cross-lattice results from checkpoint.")
+    print("  Loaded cross-lattice results from cache.")
 else:
     all_X    = np.vstack([X_train_scaled, X_test_scaled])
     all_form = np.concatenate([y_train_form, y_test_form])
@@ -1360,11 +1924,18 @@ else:
         sg_cl_tr   = all_sg[train_mask]
         n_folds_cl = min(len(np.unique(sg_cl_tr)), 5)
 
+        # Per-lattice checkpoint
         cl_ckpt = os.path.join(CHECKPOINT_DIR, f'cl_{held_sg}_v5.pkl')
         if os.path.exists(cl_ckpt):
             row_f, row_b = joblib.load(cl_ckpt)
             print(f"  {held_name:<12} (loaded from checkpoint)")
         else:
+            for target, params_cl, all_y, rows_out in [
+                    ('form', best_params_form, all_form, cross_lat_form),
+                    ('band', best_params_band, all_band, cross_lat_band)]:
+                pass  # handled below
+
+            # Train CP models for both targets simultaneously per lattice
             mapie_cl_form = MapieRegressor(
                 estimator=build_lgbm(best_params_form),
                 cv=GroupKFold(n_splits=n_folds_cl),
@@ -1399,6 +1970,8 @@ else:
                 'MeanWidth': round(float(np.mean(pis_b[:,1,0]-pis_b[:,0,0])), 4),
             }
             joblib.dump((row_f, row_b), cl_ckpt, compress=3)
+            # Mirror to results/ root immediately
+            shutil.copy2(cl_ckpt, os.path.join(RESULTS_DIR, f'cl_{held_sg}_v5.pkl'))
             del mapie_cl_form, mapie_cl_band; gc.collect()
 
         cross_lat_form.append(row_f)
@@ -1407,16 +1980,34 @@ else:
               f"{row_f['MAE']:>9.4f} {row_f['Coverage']:>9.3f} {row_f['MeanWidth']:>8.4f}  "
               f"{row_b['MAE']:>9.4f} {row_b['Coverage']:>9.3f} {row_b['MeanWidth']:>8.4f}")
 
+    # Save aggregated results
     with open(CL_CACHE, 'w') as f:
         json.dump({'formation': cross_lat_form, 'bandgap': cross_lat_band}, f, indent=2)
     save_stage('cross_lattice_complete')
 
 df_cl_form = pd.DataFrame(cross_lat_form)
 df_cl_band = pd.DataFrame(cross_lat_band)
+
+# E37: normalise lattice labels stored in pre-v7 checkpoints
+for _df in (df_cl_form, df_cl_band):
+    _df['Lattice'] = _df['Lattice'].replace(LABEL_FIX)
+
+# O1 (optional part): Clopper-Pearson 95% CIs for Table 5 coverages
+for _df in (df_cl_form, df_cl_band):
+    _ks = np.rint(_df['Coverage'].values * _df['N'].values).astype(int)
+    _ci = [clopper_pearson(k, nn) for k, nn in zip(_ks, _df['N'].values)]
+    _df['Cov_CI95_lo'] = [round(c[0], 4) for c in _ci]
+    _df['Cov_CI95_hi'] = [round(c[1], 4) for c in _ci]
+print("\n  Cross-lattice coverage 95% CIs (Table 5):")
+for _tag, _df in (('formation', df_cl_form), ('band gap', df_cl_band)):
+    for _, _r in _df.iterrows():
+        print(f"    [{_tag:<9}] {_r['Lattice']:<8} {_r['Coverage']:.3f} "
+              f"[{_r['Cov_CI95_lo']:.3f}, {_r['Cov_CI95_hi']:.3f}]  (n={int(_r['N'])})")
+
 df_cl_form.to_csv(os.path.join(RESULTS_DIR,'cross_lattice_formation_v5.csv'), index=False)
 df_cl_band.to_csv(os.path.join(RESULTS_DIR,'cross_lattice_bandgap_v5.csv'), index=False)
 
-# Cross-lattice figure (Nature double-column, 4-panel)
+# ---- Cross-lattice figure (Nature double-column, 4-panel) ----
 fig, axes = plt.subplots(2, 2, figsize=(NATURE_DOUBLE, NATURE_HEIGHT * 2.1))
 
 for col, (df_cl, tit) in enumerate([(df_cl_form,'Formation energy'),
@@ -1424,18 +2015,27 @@ for col, (df_cl, tit) in enumerate([(df_cl_form,'Formation energy'),
     x   = np.arange(len(df_cl))
     lbl = df_cl['Lattice'].tolist()
 
+    # ==========================================
+    # Panel Top Row: MAE (a) and (b)
+    # ==========================================
     axes[0, col].bar(x, df_cl['MAE'], color=PALETTE['blue'],
                      alpha=0.75, width=0.6, zorder=3)
     axes[0, col].set_xticks(x)
     axes[0, col].set_xticklabels(lbl, rotation=45, ha='right', va='top',
                                  fontsize=NATURE_FS_SM)
     axes[0, col].tick_params(axis='x', pad=2)
+
     axes[0, col].set_ylabel('MAE', fontsize=NATURE_FS_MD)
     axes[0, col].grid(axis='y', lw=0.4, alpha=0.4, zorder=0)
+
+    # Add Panel Label (a) / (b)
     lbl_top = '(a)' if col == 0 else '(b)'
     axes[0, col].text(0.0, 1.04, lbl_top, transform=axes[0, col].transAxes,
                       fontsize=NATURE_FS_LG, fontweight='bold', va='bottom', ha='left')
 
+    # ==========================================
+    # Panel Bottom Row: CP coverage (c) and (d)
+    # ==========================================
     axes[1, col].bar(x, df_cl['Coverage'], color=PALETTE['red'],
                      alpha=0.75, width=0.6, zorder=3)
     axes[1, col].axhline(1 - ALPHA, color='black', ls='--',
@@ -1444,344 +2044,129 @@ for col, (df_cl, tit) in enumerate([(df_cl_form,'Formation energy'),
     axes[1, col].set_xticklabels(lbl, rotation=45, ha='right', va='top',
                                  fontsize=NATURE_FS_SM)
     axes[1, col].tick_params(axis='x', pad=2)
+
     axes[1, col].set_ylim(0, 1.15)
     axes[1, col].set_ylabel('CP coverage', fontsize=NATURE_FS_MD)
+
+    # --- LEGEND HEIGHT FIX APPLIED HERE ---
     axes[1, col].legend(fontsize=NATURE_FS_SM, loc='lower right',
                         bbox_to_anchor=(1.0, 1.01), frameon=False)
+    # --------------------------------------
+
     axes[1, col].grid(axis='y', lw=0.4, alpha=0.4, zorder=0)
+
+    # Add Panel Label (c) / (d)
     lbl_bot = '(c)' if col == 0 else '(d)'
     axes[1, col].text(0.0, 1.04, lbl_bot, transform=axes[1, col].transAxes,
                       fontsize=NATURE_FS_LG, fontweight='bold', va='bottom', ha='left')
-    for xi, (_, row_cl) in zip(x, df_cl.iterrows()):
-        axes[1, col].text(xi, row_cl['Coverage'] + 0.02, f'n={row_cl["N"]}',
+
+    # Annotate N (with zorder and bbox to protect text from grid lines)
+    for xi, (_, row) in zip(x, df_cl.iterrows()):
+        axes[1, col].text(xi, row['Coverage'] + 0.02, f'n={row["N"]}',
                           ha='center', va='bottom', fontsize=5, zorder=10,
                           bbox=dict(facecolor='white', alpha=0.85, edgecolor='none', pad=1))
 
+# Lifted the suptitle slightly to clear the panel labels
 plt.suptitle('Cross-lattice generalisation experiment\n'
              '(one lattice held out per run, trained on remaining 5)',
              fontsize=NATURE_FS_LG, y=1.05)
+
 plt.tight_layout()
+fig.savefig(os.path.join(RESULTS_DIR, 'cross_lattice_v5.jpg'), dpi=600, bbox_inches='tight')  # JPG companion
 save_fig(fig, 'cross_lattice_v5.pdf')
 
-# Figure: Mean Width vs MAE scatter (Cross-Lattice)
-print("\n  Generating Cross-Lattice Scatter Plot...")
 
+# FIGURE 9: Mean Width vs MAE Scatter Plot (Cross-Lattice)
+
+print("\n  Generating Cross-Lattice Scatter Plot (Figure 9)...")
+
+# 1. Calculate the correlations directly from the freshly built dataframes
 r_form_cl = pearsonr(df_cl_form['MeanWidth'], df_cl_form['MAE'])[0]
 r_band_cl = pearsonr(df_cl_band['MeanWidth'], df_cl_band['MAE'])[0]
+
 print(f"  Pearson(mean_width, MAE) across lattices:")
 print(f"    Formation: r = {r_form_cl:.4f}")
 print(f"    Band Gap:  r = {r_band_cl:.4f}")
 
+# 2. Draw the figure
 fig, axes = plt.subplots(1, 2, figsize=(NATURE_DOUBLE, NATURE_HEIGHT))
+
 for i, (ax, df, r_val, title) in enumerate(zip(
-    axes, [df_cl_form, df_cl_band], [r_form_cl, r_band_cl],
+    axes,
+    [df_cl_form, df_cl_band],
+    [r_form_cl, r_band_cl],
     ['Formation energy', 'Band gap']
 )):
     x_vals = df['MeanWidth'].values
     y_vals = df['MAE'].values
+
+    # Scatter plot of the 6 lattices
     ax.scatter(x_vals, y_vals, s=30, color=PALETTE['blue'], alpha=0.8, zorder=3)
+
+    # Calculate and plot the line of best fit
     m, b = np.polyfit(x_vals, y_vals, 1)
     x_fit = np.linspace(x_vals.min() - 0.01, x_vals.max() + 0.01, 100)
     ax.plot(x_fit, m * x_fit + b, color=PALETTE['red'], ls='--', lw=NATURE_LW,
             label=f'r = {r_val:.2f}', zorder=2)
+
+    # Formatting
     ax.set_xlabel('Mean interval width', fontsize=NATURE_FS_MD)
     ax.set_ylabel('MAE (eV/atom)' if i == 0 else 'MAE (eV)', fontsize=NATURE_FS_MD)
+
+    # Add Lattice Names next to the dots so readers know which dot is which
     for xi, yi, label in zip(x_vals, y_vals, df['Lattice']):
         ax.annotate(label, (xi, yi), textcoords="offset points", xytext=(5,0),
                     ha='left', fontsize=NATURE_FS_SM)
+
+    # Panel Labels (a) and (b)
     panel_label = '(a)' if i == 0 else '(b)'
     ax.text(0.0, 1.04, panel_label, transform=ax.transAxes,
             fontsize=NATURE_FS_LG, fontweight='bold', va='bottom', ha='left')
+
     ax.legend(fontsize=NATURE_FS_SM, loc='best', frameon=False)
     ax.grid(lw=0.4, alpha=0.4, zorder=0)
 
 plt.tight_layout(rect=[0, 0, 1, 0.95])
+fig.savefig(os.path.join(RESULTS_DIR, 'cross_lattice_scatter_v5.jpg'), dpi=600, bbox_inches='tight')  # JPG companion
 save_fig(fig, 'cross_lattice_scatter_v5.pdf')
+print("  Figure saved: cross_lattice_scatter_v5.pdf (and .jpg)")
+
 
 # =============================================================================
-# SECTION 11: SUMMARY TABLE + ALL OUTPUTS
+# VERIFICATION: does Fd-3m have the widest spread of Max_0039 in the test set?
+# (Supports the claim in Section 3.4: "produces the test set's widest spread
+#  of Max_0039 values". Report the verdict line back before submission.)
 # =============================================================================
-print("\n--- Section 11: Summary Table ---")
+import numpy as np
+import pandas as pd
 
-summary = pd.DataFrame({
-    'Metric': [
-        'MAE Formation (eV/atom)', 'MAE Band Gap (eV)',
-        'RMSLE Formation', 'RMSLE Band Gap',
-        'R2 Formation', 'R2 Band Gap',
-        'CP Coverage Formation (90% nominal)', 'CP Coverage Band Gap',
-        'Mean Interval Width Formation', 'Mean Interval Width Band Gap',
-        'Pearson(width,|err|) Formation', 'Pearson(width,|err|) Band Gap',
-        'SHAP Kendall tau Formation (mean)', 'SHAP Kendall tau Band Gap (mean)',
-        'Indium proxy rho (band gap top feature)',
-    ],
-    'Value': [
-        round(res_form['mae'],5), round(res_band['mae'],5),
-        round(res_form['rmsle'],5), round(res_band['rmsle'],5),
-        round(res_form['r2'],4), round(res_band['r2'],4),
-        round(res_form['coverage'],4), round(res_band['coverage'],4),
-        round(res_form['mean_width'],4), round(res_band['mean_width'],4),
-        round(res_form['pearson_r'],4), round(res_band['pearson_r'],4),
-        round(tau_mean_form,4), round(tau_mean_band,4),
-        round(rho_b,4),
-    ],
-    'Reference / Note': [
-        'cf. Sutton et al. (2019) Table 1', 'cf. Sutton et al. (2019) Table 1',
-        'NOMAD 2018 competition metric', 'NOMAD 2018 competition metric',
-        '', '',
-        'GroupKFold CV+ guarantee', 'GroupKFold CV+ guarantee',
-        '', '',
-        '>0 = informative intervals', '>0 = informative intervals',
-        '>0.9 = stable feature rankings', '>0.9 = stable feature rankings',
-        '<0.9 = SOAP not pure In proxy',
-    ]
-})
+col = FEATURE_NAMES.index('Max_0039')
+vals = X_test_scaled[:, col]
 
-summary_csv = os.path.join(RESULTS_DIR, 'summary_metrics_v5.csv')
-summary.to_csv(summary_csv, index=False)
-print(summary.to_string(index=False))
+rows = []
+for sg_int, sg_name in LATTICE_MAP.items():
+    msk = (sg_test == sg_int)
+    v = vals[msk]
+    rows.append({
+        'Lattice': sg_name,
+        'N': int(msk.sum()),
+        'Std': round(float(np.std(v)), 4),
+        'Range': round(float(np.ptp(v)), 4),          # max - min
+        'IQR': round(float(np.percentile(v, 75) - np.percentile(v, 25)), 4),
+    })
 
-# Save final models to CHECKPOINT_DIR
-for name, obj in [
-        ('mapie_form_v5_final.pkl', mapie_form),
-        ('mapie_band_v5_final.pkl', mapie_band),
-        ('scaler_v5.pkl', scaler)]:
-    path = os.path.join(CHECKPOINT_DIR, name)
-    joblib.dump(obj, path, compress=3)
-    print(f"  Saved: {name}")
+df = pd.DataFrame(rows).sort_values('Std', ascending=False).reset_index(drop=True)
+print(df.to_string(index=False))
 
-save_stage('pipeline_complete')
-print(f"\nAll outputs saved to: {RESULTS_DIR}/")
+top_std, top_rng = df.iloc[0]['Lattice'], df.sort_values('Range', ascending=False).iloc[0]['Lattice']
+print(f"\nWidest spread by Std   : {top_std}")
+print(f"Widest spread by Range : {top_rng}")
 
-# =============================================================================
-# SECTION 12: MANUSCRIPT EVIDENCE CHECKLIST
-# =============================================================================
-print("\n--- Section 12: npj Manuscript Evidence Checklist ---")
+if top_std == 'Fd-3m':
+    print("\nVERDICT: CLAIM SUPPORTED - keep the Section 3.4 sentence as written.")
+else:
+    print(f"\nVERDICT: CLAIM NOT SUPPORTED - {top_std} has the widest Max_0039 spread.")
+    print("Report this back so the Section 3.4 sentence and the linked argument get reworked.")
 
-checklist = f"""
-npj Computational Materials -- Submission Checklist (v5)
-=========================================================
-GPU used: {USE_GPU}
-Figure DPI: {NATURE_DPI}
-Font: Arial/Helvetica {NATURE_FS_MD}pt (labels) / {NATURE_FS_SM}pt (ticks)
-
-Task A   [Indium proxy]:
-  Band Gap   rho = {rho_b:.4f}  p = {p_b:.2e}
-  Formation  rho = {rho_f:.4f}  p = {p_f:.2e}
-
-Task A.2 [SHAP stability, 5 seeds, top-10 Kendall tau]:
-  Formation: mean tau = {tau_mean_form:.4f}  min = {tau_min_form:.4f}
-  Band Gap:  mean tau = {tau_mean_band:.4f}  min = {tau_min_band:.4f}
-
-Task B   [Conditional coverage]:
-  -> cond_coverage_formation_v5.csv / cond_coverage_bandgap_v5.csv
-  -> conditional_coverage_combined.csv
-  -> fig_conditional_coverage_subset.pdf
-
-Task C   [Leakage defence]:
-  -> leakage_defence_v5.csv
-
-Novel contributions vs. Sutton et al. (2019):
-  1. CP guarantee: formation cov={res_form['coverage']:.3f}  band gap cov={res_band['coverage']:.3f}  [nominal=0.90]
-  2. Extended SOAP (mean+std+min+max vs mean-only)
-  3. GroupKFold by spacegroup in HPO + MAPIE
-  4. Spacegroup-stratified coverage (sg_coverage_*_v5.csv)
-  5. Cross-lattice CP coverage experiment (cross_lattice_*_v5.csv)
-  6. Interval-width informativeness Pearson r
-
-Figures saved to {RESULTS_DIR}/:
-  parity_formation_v5.pdf        parity_bandgap_v5.pdf
-  sg_coverage_v5.pdf             cross_lattice_v5.pdf
-  shap_beeswarm_form_v5.pdf      shap_beeswarm_band_v5.pdf
-  alpha_grid_form_v5.pdf         alpha_grid_band_v5.pdf
-  width_informativeness_*.pdf    indium_proxy_v5.pdf
-  fig_conditional_coverage_subset.pdf
-  cross_lattice_scatter_v5.pdf
-"""
-print(checklist)
-with open(os.path.join(RESULTS_DIR, 'manuscript_checklist_v5.txt'), 'w') as f:
-    f.write(checklist)
-
-# =============================================================================
-# SECTION 13: FULL RESULTS DUMP
-# =============================================================================
-SEP  = "=" * 70
-SEP2 = "-" * 70
-
-def _hr(title=""):
-    print(f"\n{SEP}")
-    if title:
-        pad = (70 - len(title) - 2) // 2
-        print(" " * pad + f" {title} ")
-    print(SEP)
-
-def _sec(title):
-    print(f"\n{SEP2}")
-    print(f"  {title}")
-    print(SEP2)
-
-_hr("FULL RESULTS DUMP -- ANATOMY OF UNCERTAINTY v5")
-print("Copy everything between the ==== lines and paste for verification.\n")
-
-_sec("DATASET")
-print(f"  Total structures (valid):    {X_train_scaled.shape[0] + X_test_scaled.shape[0]}")
-print(f"  Training set size:           {X_train_scaled.shape[0]}")
-print(f"  Test set size:               {X_test_scaled.shape[0]}")
-print(f"  SOAP feature dimension:      {X_train_scaled.shape[1]}")
-print(f"  SOAP_DIM (per statistic):    {SOAP_DIM}")
-print(f"  Aggregation:                 mean + std + min + max  (4 x {SOAP_DIM})")
-print(f"\n  Spacegroup distribution (FULL dataset):")
-for sg, name in LATTICE_MAP.items():
-    n_all  = int(np.sum(np.concatenate([sg_train, sg_test]) == sg))
-    n_tr   = int(np.sum(sg_train == sg))
-    n_te   = int(np.sum(sg_test  == sg))
-    print(f"    {name:<10}  SG {sg:>3}:  total={n_all:>4}  train={n_tr:>4}  test={n_te:>3}")
-
-_sec("HYPERPARAMETER OPTIMISATION  (Optuna TPE + GroupKFold)")
-print(f"  GPU used: {USE_GPU}")
-print(f"\n  Formation energy best params:")
-for k, v in best_params_form.items():
-    print(f"    {k:<22} = {v}")
-print(f"\n  Band gap best params:")
-for k, v in best_params_band.items():
-    print(f"    {k:<22} = {v}")
-
-_sec("MAIN PREDICTION METRICS  (test set, stratified split)")
-print(f"  {'Metric':<35} {'Formation':>12} {'Band Gap':>12}")
-print(f"  {'-'*60}")
-for label, key in [
-    ('MAE  (eV/atom or eV)',    'mae'),
-    ('RMSE (eV/atom or eV)',    'rmse'),
-    ('RMSLE (competition metric)', 'rmsle'),
-    ('R2',                      'r2'),
-]:
-    print(f"  {label:<35} {res_form[key]:>12.5f} {res_band[key]:>12.5f}")
-
-_sec(f"CONFORMAL PREDICTION  (CV+, GroupKFold, nominal coverage = {1-ALPHA:.0%})")
-print(f"  {'Metric':<35} {'Formation':>12} {'Band Gap':>12}")
-print(f"  {'-'*60}")
-for label, key in [
-    ('Empirical coverage',        'coverage'),
-    ('Mean interval width',       'mean_width'),
-    ('Pearson(width, |error|)',   'pearson_r'),
-    ('Pearson p-value',           'pearson_p'),
-]:
-    print(f"  {label:<35} {res_form[key]:>12.5f} {res_band[key]:>12.5f}")
-print(f"\n  Coverage delta (empirical - nominal):")
-print(f"    Formation:  {res_form['coverage'] - (1-ALPHA):+.5f}")
-print(f"    Band Gap:   {res_band['coverage'] - (1-ALPHA):+.5f}")
-
-_sec("ALPHA-GRID  (nominal vs empirical coverage)")
-print(f"  {'alpha':>6} {'nominal':>9} {'cov_form':>10} {'w_form':>9} "
-      f"{'cov_band':>10} {'w_band':>9}")
-print(f"  {'-'*60}")
-for a in ALPHAS:
-    _, pf = mapie_form.predict(X_test_scaled, alpha=a)
-    _, pb = mapie_band.predict(X_test_scaled, alpha=a)
-    cf = regression_coverage_score(y_test_form, pf[:,0,0], pf[:,1,0])
-    wf = float(np.mean(pf[:,1,0] - pf[:,0,0]))
-    cb = regression_coverage_score(y_test_band, pb[:,0,0], pb[:,1,0])
-    wb = float(np.mean(pb[:,1,0] - pb[:,0,0]))
-    print(f"  {a:>6.2f} {1-a:>9.2f} {cf:>10.4f} {wf:>9.4f} "
-          f"{cb:>10.4f} {wb:>9.4f}")
-
-_sec("CONDITIONAL COVERAGE  (Task B, physics-based subsets)")
-print(f"\n  FORMATION ENERGY subsets:")
-print(f"  {'Subset':<48} {'N':>5} {'Coverage':>9} {'MAE':>9} {'Width':>8}")
-print(f"  {'-'*82}")
-for lbl, msk in form_subsets:
-    if not msk.any(): continue
-    cov = regression_coverage_score(y_test_form[msk], res_form['lo'][msk], res_form['hi'][msk])
-    mae = mean_absolute_error(y_test_form[msk], res_form['y_pred'][msk])
-    w   = float(np.mean(res_form['hi'][msk] - res_form['lo'][msk]))
-    print(f"  {lbl:<48} {msk.sum():>5} {cov:>9.4f} {mae:>9.4f} {w:>8.4f}")
-
-print(f"\n  BAND GAP subsets:")
-print(f"  {'Subset':<48} {'N':>5} {'Coverage':>9} {'MAE':>9} {'Width':>8}")
-print(f"  {'-'*82}")
-for lbl, msk in band_subsets:
-    if not msk.any(): continue
-    cov = regression_coverage_score(y_test_band[msk], res_band['lo'][msk], res_band['hi'][msk])
-    mae = mean_absolute_error(y_test_band[msk], res_band['y_pred'][msk])
-    w   = float(np.mean(res_band['hi'][msk] - res_band['lo'][msk]))
-    print(f"  {lbl:<48} {msk.sum():>5} {cov:>9.4f} {mae:>9.4f} {w:>8.4f}")
-
-_sec("SPACEGROUP-STRATIFIED COVERAGE  (Section 6.3 -- Novel)")
-print(f"  {'Lattice':<10} {'SG':>4} {'N':>5}  "
-      f"{'Cov_F':>7} {'W_F':>8} {'MAE_F':>8}  "
-      f"{'Cov_B':>7} {'W_B':>8} {'MAE_B':>8}")
-print(f"  {'-'*75}")
-for row_f, row_b in zip(sg_rows_form, sg_rows_band):
-    print(f"  {row_f['Lattice']:<10} {row_f['SG']:>4} {row_f['N']:>5}  "
-          f"{row_f['Coverage']:>7.4f} {row_f['MeanWidth']:>8.4f} {row_f['MAE']:>8.4f}  "
-          f"{row_b['Coverage']:>7.4f} {row_b['MeanWidth']:>8.4f} {row_b['MAE']:>8.4f}")
-
-_sec("LEAKAGE DEFENCE  (Task C)")
-print(f"  Most-frequent composition group: {focal['group']}")
-print(f"    N={focal['n']}  MAE_form={focal['mae_form']:.5f}  "
-      f"MAE_band={focal['mae_band']:.5f}")
-print(f"  Least-frequent composition group: {rare['group']}")
-print(f"    N={rare['n']}  MAE_form={rare['mae_form']:.5f}  "
-      f"MAE_band={rare['mae_band']:.5f}")
-print(f"  MAE ratio (frequent/rare, formation): {ratio:.3f}")
-print(f"  Interpretation: ratio < 2.0 = no severe leakage artefact")
-print(f"  Total unique composition groups in test set: {len(group_stats)}")
-
-_sec("SHAP FEATURE IMPORTANCE  (top-10 features)")
-print(f"\n  FORMATION ENERGY:")
-mean_abs_form = np.abs(sv_form).mean(axis=0)
-top10_form = np.argsort(mean_abs_form)[::-1][:10]
-for rank, idx in enumerate(top10_form, 1):
-    print(f"    {rank:>2}. {FEATURE_NAMES[idx]:<14}  mean|SHAP| = {mean_abs_form[idx]:.6f}")
-
-print(f"\n  BAND GAP:")
-mean_abs_band = np.abs(sv_band).mean(axis=0)
-top10_band = np.argsort(mean_abs_band)[::-1][:10]
-for rank, idx in enumerate(top10_band, 1):
-    print(f"    {rank:>2}. {FEATURE_NAMES[idx]:<14}  mean|SHAP| = {mean_abs_band[idx]:.6f}")
-
-_sec("SHAP STABILITY  (Task A.2 -- Kendall tau, 5 seeds, top-10 features)")
-print(f"  Formation energy:  mean tau = {tau_mean_form:.5f}  "
-      f"min tau = {tau_min_form:.5f}")
-print(f"  Band gap:          mean tau = {tau_mean_band:.5f}  "
-      f"min tau = {tau_min_band:.5f}")
-print(f"  Threshold for 'stable': tau > 0.9")
-print(f"  Formation stable: {'YES' if tau_mean_form > 0.9 else 'NO -- check'}")
-print(f"  Band gap stable:  {'YES' if tau_mean_band > 0.9 else 'NO -- check'}")
-
-_sec("INDIUM PROXY CHECK  (Task A -- Spearman rho)")
-print(f"  Formation top feature:  {topnames_form[0]}")
-print(f"    Spearman rho vs In%:  {rho_f:.5f}  p = {p_f:.3e}")
-print(f"  Band gap top feature:   {topnames_band[0]}")
-print(f"    Spearman rho vs In%:  {rho_b:.5f}  p = {p_b:.3e}")
-print(f"  Threshold: rho < 0.90 = SOAP not a simple In proxy")
-print(f"  Formation: {'PASS (rho < 0.90)' if abs(rho_f) < 0.90 else 'WARN (rho >= 0.90)'}")
-print(f"  Band gap:  {'PASS (rho < 0.90)' if abs(rho_b) < 0.90 else 'WARN (rho >= 0.90)'}")
-
-_sec("CROSS-LATTICE GENERALISATION  (Section 10 -- Novel)")
-print(f"  cf. Sutton et al. (2019) Table 3")
-print(f"\n  {'Lattice':<10} {'N':>5}  "
-      f"{'MAE_F':>8} {'Cov_F':>7} {'W_F':>8}  "
-      f"{'MAE_B':>8} {'Cov_B':>7} {'W_B':>8}")
-print(f"  {'-'*75}")
-for rf, rb in zip(cross_lat_form, cross_lat_band):
-    print(f"  {rf['Lattice']:<10} {rf['N']:>5}  "
-          f"{rf['MAE']:>8.4f} {rf['Coverage']:>7.3f} {rf['MeanWidth']:>8.4f}  "
-          f"{rb['MAE']:>8.4f} {rb['Coverage']:>7.3f} {rb['MeanWidth']:>8.4f}")
-
-r_cl_f = pearsonr(df_cl_form['MeanWidth'], df_cl_form['MAE'])[0]
-r_cl_b = pearsonr(df_cl_band['MeanWidth'], df_cl_band['MAE'])[0]
-print(f"\n  Pearson(mean_width, MAE) across lattices:")
-print(f"    Formation: r = {r_cl_f:.5f}")
-print(f"    Band Gap:  r = {r_cl_b:.5f}")
-print(f"  Positive r = wider intervals correctly signal harder generalisations.")
-
-_sec("OUTPUT FILES")
-for fn in sorted(os.listdir(RESULTS_DIR)):
-    fpath = os.path.join(RESULTS_DIR, fn)
-    if os.path.isfile(fpath):
-        size = os.path.getsize(fpath)
-        print(f"  {fn:<50}  {size/1024:>8.1f} KB")
-
-_hr("END OF RESULTS DUMP")
-print("=== ANATOMY OF UNCERTAINTY v5 -- PIPELINE COMPLETE ===")
-print(f"Outputs: {RESULTS_DIR}/  |  Checkpoints: {CHECKPOINT_DIR}/")
+df.to_csv(os.path.join(RESULTS_DIR, 'max0039_spread_by_spacegroup_v7.csv'), index=False)
+print("\nSaved: max0039_spread_by_spacegroup_v7.csv")
