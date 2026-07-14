@@ -25,9 +25,9 @@ coverage guarantees to conceal per-spacegroup coverage failures.
 | `results/checkpoints/best_params_v5.json` | Optuna-selected LightGBM hyperparameters (Table 1) |
 | `results/outlier_sg227_2202.cif` | Figure 9 structure (NOMAD ID 2202), exported for VESTA |
 
-## Reproducing the results (no Google Drive needed)
+## Reproducing the results 
 
-### 1. Checkpoint mode — recommended for reviewers (~10–20 min)
+### 1. Checkpoint mode 
 
 ```bash
 git clone https://github.com/johmar-22/tco-conformal-uq.git
@@ -46,7 +46,7 @@ tables and figures into `results/`.
 
 Set `TCO_UQ_NO_DOWNLOAD=1` to forbid all checkpoint downloads.
 
-### 2. Full re-computation mode (~4 h CPU / ~45 min CUDA GPU)
+### 2. Full re-computation mode
 
 Delete `results/checkpoints/*.npz` and `*.pkl`, then provide the NOMAD 2018
 geometry files (not redistributable here; download from
@@ -89,9 +89,7 @@ The NOMAD 2018 dataset (3,000 DFT-PBE calculations) is available on
 geometry files are required only for full re-computation and are not
 redistributed in this repository.
 
-## License
 
-Released under the MIT License (see `LICENSE`).
 
 
 
