@@ -77,8 +77,12 @@ def main():
                     help='also print the full block layout')
     args = ap.parse_args()
 
-    import importlib.metadata
-    print(f"DScribe version: {importlib.metadata.version('dscribe')}")
+    try:
+        import importlib.metadata
+        dscribe_version = importlib.metadata.version('dscribe')
+    except Exception:
+        dscribe_version = 'unknown (package metadata unavailable)'
+    print(f"DScribe version: {dscribe_version}")
     soap  = get_soap()
     pairs = pair_list(soap)
     assert soap.get_number_of_features() == 5994
