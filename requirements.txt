@@ -1,13 +1,6 @@
 # Requirements for:
 # "Conformal Uncertainty Quantification for Transparent Conductive Oxide
 #  Property Prediction: Coverage Diagnostics Under Crystal Symmetry Heterogeneity"
-#
-# O6 audit (adviser surgical-edit list, 5 Jul 2026): versions used for the
-# archived results are PINNED. MAPIE's API changed across 0.8/0.9/1.x and
-# DScribe's feature ordering is version-dependent behaviour we cite in the
-# manuscript, so these two pins are mandatory for reproduction.
-# After the final archival run, replace the >= entries below with the exact
-# versions from `pip freeze` in that environment.
 
 # Conformal prediction (API-critical: do not upgrade)
 mapie==0.8.6
