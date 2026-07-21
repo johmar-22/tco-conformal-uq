@@ -4,8 +4,8 @@ uncertainty_quan.py
 ===================
 
     "Conformal Uncertainty Quantification for Transparent Conductive Oxide
-     Property Prediction: Coverage Diagnostics Under Crystal Symmetry
-     Heterogeneity"
+     Property Prediction: Coverage Diagnostics Across Crystal Symmetry
+     Classes"
 
 Usage
 -----
