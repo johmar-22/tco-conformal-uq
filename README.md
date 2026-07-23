@@ -21,8 +21,8 @@ coverage guarantees to conceal per-spacegroup coverage failures.
 | `decode_soap_index.py` | Standalone utility mapping any SOAP feature index to its (species pair, n, n′, l) assignment via DScribe `get_location()` |
 | `requirements.txt` | Pinned dependencies (`mapie==0.8.6`, `dscribe==2.1.2` are reproduction-critical) |
 | `results/*.csv` | Pre-computed result tables cited in the paper (per-spacegroup and cross-lattice coverage with Clopper–Pearson CIs, conditional coverage, leakage defence, alpha grid, ensemble baseline, SOAP diversity, feature decodings, top-k attribution agreement) |
-| `results/*.pdf` | Publication figures (600 DPI, Nature format) |
-| `results/checkpoints/best_params_v5.json` | Optuna-selected LightGBM hyperparameters (Table 1) |
+| `results/*.pdf` | Figures (600 DPI |
+| `results/checkpoints/best_params_v5.json` | Optuna-selected LightGBM hyperparameters (Table 5) |
 | `results/outlier_sg227_2202.cif` | Figure 9 structure (NOMAD ID 2202), exported for VESTA |
 
 ## Reproducing the results 
