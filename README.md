@@ -5,7 +5,6 @@ Code and data for:
 > **Conformal Uncertainty Quantification for Transparent Conductive Oxide
 > Property Prediction: Coverage Diagnostics Across Crystal Symmetry
 > Classes**
-> Johaimen M. Omar and Muhammed Tan
 
 We apply cross-conformal prediction (CV+, MAPIE) to LightGBM models on
 extended SOAP descriptors for the NOMAD 2018 benchmark of
