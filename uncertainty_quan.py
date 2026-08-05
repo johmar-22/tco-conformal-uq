@@ -1303,26 +1303,7 @@ else:
     print(f"\nASE figure saved: {ase_fig_path}")
     plt.show()
 
-# ── 4. Caption text (fill in actual numbers after running) ───────────────────
-print(f"""
-=== SUGGESTED FIGURE CAPTION ===
 
-Figure X | Crystal structure of a representative high-uncertainty outlier
-in the Fd-3m (SG 227, spinel-type) subgroup. The structure (NOMAD ID
-{structure_id}) has a DFT-PBE band gap of {true_bg:.2f} eV, with a
-predicted value of {pred_bg:.2f} eV and a 90% CP interval of
-[{interval_lo:.2f}, {interval_hi:.2f}] eV (width = {interval_w:.2f} eV),
-the widest in the test set for this spacegroup. The cubic Fd-3m lattice
-places cations on both tetrahedrally and octahedrally coordinated sites
-(shown as O-centred polyhedra), producing a diversity of local Al/Ga/In
-environments not represented in the other five spacegroups. This
-structural heterogeneity reduces the similarity between Fd-3m test
-residuals and the calibration distribution, driving both elevated
-prediction error (|error| = {abs_error:.2f} eV) and the CP interval
-widening observed for SG 227 in Table 4.
-Colours: O (red), Al (grey), Ga (teal), In (purple).
-Rendered with [VESTA / ASE v3.x].
-""")
 
 
 
