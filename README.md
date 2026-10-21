@@ -2,9 +2,8 @@
 
 Code and data for:
 
-> **Conformal Uncertainty Quantification for Machine-Learning Screening of Transparent
-> Conductive Oxides Across Crystal Symmetry Classes**
-> J. M. Omar and M. Tan, submitted to *Journal of Chemical Information and Modeling*.
+> **Conformal Prediction Reliability Across Crystal Symmetry Classes in Transparent Conductive Oxide Screening**
+> J. M. Omar and M. Tan
 
 We apply CV+ conformal prediction (MAPIE) to LightGBM models on extended SOAP
 descriptors for the NOMAD 2018 benchmark of
