@@ -1,12 +1,12 @@
 # =============================================================================
-# STANDALONE CELL - Duplicate-entry check for Section 2.1 (data curation)
+# Duplicate-entry check for Section 2.1 (data curation)
 #
 # 1) Finds entries in NOMAD 2018 train.csv that are identical in spacegroup, atom count,
 #    Al/Ga/In fractions, all six lattice parameters, formation energy and band gap.
 # 2) Reproduces the paper's train/test split (StratifiedShuffleSplit by spacegroup,
 #    test_size = 0.2, random_state = 42) and counts test structures with an identical
 #    entry in training.
-# 3) If the geometry files are available (Drive: NOMAD_Uncer_Quan/train/<id>/geometry.xyz),
+# 3) If the geometry files are available,
 #    also checks whether the entries of each group are the same atomic structure, allowing for
 #    symmetry operations (see the geometry-check section below).
 #
@@ -61,9 +61,7 @@ for g in cross:
 
 
 # ---- geometry check (symmetry-aware) ------------------------------------------------------
-# v2: the first version only allowed a translation and therefore reported symmetry-equivalent
-# copies (same structure written with the cations on symmetry-related sites) as different.
-# Two independent tests are now used; a pair counts as the same structure only if BOTH agree:
+# Two independent tests are used; a pair counts as the same structure only if BOTH agree:
 #   (a) ASE SymmetryEquivalenceCheck (allows rotations, reflections and lattice re-choices);
 #   (b) identical sorted interatomic-distance lists for every element pair within 6 A.
 import itertools
