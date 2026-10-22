@@ -105,4 +105,4 @@ The NOMAD 2018 dataset (3,000 DFT-PBE calculations) is available on
 `train.csv` (2,400 public structures) is downloaded automatically. Raw geometry files
 are required only for full re-computation and are not redistributed here.
 
-UNDER REVIEW
+PAPER UNDER REVIEW
