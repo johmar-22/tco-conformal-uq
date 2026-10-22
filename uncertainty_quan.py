@@ -3,9 +3,7 @@
 uncertainty_quan.py
 ===================
 
-    "Conformal Uncertainty Quantification for Machine-Learning Screening of Transparent
-    Conductive Oxides Across Crystal Symmetry Classes
-    "
+    "Conformal Prediction Reliability Across Crystal Symmetry Classes in Transparent Conductive Oxide Screening"
 
 Usage
 -----
