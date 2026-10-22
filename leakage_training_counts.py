@@ -1,6 +1,6 @@
 # =============================================================================
-# STANDALONE CELL - Leakage check by TRAINING-set composition counts
-# Reproduces the numbers in the revised last paragraph of Section 3.5.
+# Leakage check by TRAINING-set composition counts
+# Reproduces the numbers in the last paragraph of Section 3.5.
 # Inputs : leakage_defence_v5.csv (per test composition group: n, mae_form, mae_band)
 #          train.csv (NOMAD 2018, downloaded from GitHub)
 # Output : leakage_training_counts_v7.csv in the same folder (results/ inside the repo)
@@ -11,9 +11,7 @@ import pandas as pd
 from scipy.stats import spearmanr
 from sklearn.model_selection import StratifiedShuffleSplit
 
-# Where to read leakage_defence_v5.csv and write the result:
-#   * inside the repository  -> results/   (python leakage_training_counts.py)
-#   * in Colab without a repo -> the Drive folder used by the notebook
+
 if os.path.exists(os.path.join('results', 'leakage_defence_v5.csv')):
     GDRIVE_DIR = 'results'
 else:
